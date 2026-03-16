@@ -3,7 +3,8 @@ import { execSync } from 'node:child_process'
 import path from 'node:path'
 import os from 'node:os'
 import { config } from '@/lib/config'
-import { getDatabase } from '@/lib/db'
+import Database from 'better-sqlite3'
+import { isPostgresProvider } from '@/lib/prisma'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -362,9 +363,9 @@ function scanOpenClaw(): Category {
   checks.push({
     id: 'exec_restricted',
     name: 'Exec tool restricted',
-    status: execSecurity === 'deny' ? 'pass' : execSecurity === 'sandbox' ? 'pass' : 'warn',
+    status: execSecurity === 'deny' ? 'pass' : execSecurity === 'allowlist' ? 'pass' : 'warn',
     detail: `Exec security: ${execSecurity || 'default'}`,
-    fix: execSecurity !== 'deny' && execSecurity !== 'sandbox' ? 'Set tools.exec.security to "deny" or "sandbox"' : '',
+    fix: execSecurity !== 'deny' && execSecurity !== 'allowlist' ? 'Set tools.exec.security to "deny" or "allowlist"' : '',
     severity: 'high',
   })
 
@@ -554,16 +555,30 @@ function scanRuntime(): Category {
   }
 
   try {
-    const db = getDatabase()
-    const result = db.prepare('PRAGMA integrity_check').get() as { integrity_check: string } | undefined
-    checks.push({
-      id: 'db_integrity',
-      name: 'Database integrity',
-      status: result?.integrity_check === 'ok' ? 'pass' : 'fail',
-      detail: result?.integrity_check === 'ok' ? 'Integrity check passed' : `Integrity: ${result?.integrity_check || 'unknown'}`,
-      fix: result?.integrity_check !== 'ok' ? 'Database may be corrupted — restore from backup' : '',
-      severity: 'critical',
-    })
+    if (isPostgresProvider()) {
+      checks.push({
+        id: 'db_integrity',
+        name: 'Database integrity',
+        status: 'warn',
+        detail: 'Integrity check is SQLite-only (Postgres provider configured)',
+        fix: '',
+        severity: 'critical',
+      })
+    } else {
+      const sqlite = new Database(config.dbPath)
+      sqlite.pragma('busy_timeout = 5000')
+      const result = sqlite.prepare('PRAGMA integrity_check').get() as { integrity_check: string } | undefined
+      sqlite.close()
+
+      checks.push({
+        id: 'db_integrity',
+        name: 'Database integrity',
+        status: result?.integrity_check === 'ok' ? 'pass' : 'fail',
+        detail: result?.integrity_check === 'ok' ? 'Integrity check passed' : `Integrity: ${result?.integrity_check || 'unknown'}`,
+        fix: result?.integrity_check !== 'ok' ? 'Database may be corrupted — restore from backup' : '',
+        severity: 'critical',
+      })
+    }
   } catch {
     checks.push({ id: 'db_integrity', name: 'Database integrity', status: 'warn', detail: 'Could not run integrity check', fix: '', severity: 'critical' })
   }

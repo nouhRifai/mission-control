@@ -7,7 +7,7 @@
  * Layer 4 (Drift): Rolling baseline comparison with threshold detection
  */
 
-import { getDatabase } from '@/lib/db'
+import { getPrismaClient } from '@/lib/prisma'
 
 export type EvalLayer = 'output' | 'trace' | 'component' | 'drift'
 
@@ -35,21 +35,20 @@ export function evalTaskCompletion(
   agentName: string,
   hours: number = 168,
   workspaceId: number = 1,
-): EvalResult {
-  const db = getDatabase()
+): Promise<EvalResult> {
+  const prisma = getPrismaClient()
   const since = Math.floor(Date.now() / 1000) - hours * 3600
 
-  const row = db.prepare(`
-    SELECT
-      COUNT(*) as total,
-      SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) as completed,
-      SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) as successful
-    FROM tasks
-    WHERE assigned_to = ? AND workspace_id = ? AND created_at > ?
-  `).get(agentName, workspaceId, since) as any
+  return (async () => {
+    const [total, completed] = await Promise.all([
+      prisma.tasks.count({
+        where: { assigned_to: agentName, workspace_id: workspaceId, created_at: { gt: since } },
+      }),
+      prisma.tasks.count({
+        where: { assigned_to: agentName, workspace_id: workspaceId, created_at: { gt: since }, status: 'done' },
+      }),
+    ])
 
-  const total = row?.total ?? 0
-  const completed = row?.completed ?? 0
   const score = total > 0 ? completed / total : 1.0
 
   return {
@@ -58,29 +57,39 @@ export function evalTaskCompletion(
     passed: score >= 0.7,
     detail: `${completed}/${total} tasks completed (${(score * 100).toFixed(0)}%)`,
   }
+  })()
 }
 
 export function evalCorrectnessScore(
   agentName: string,
   hours: number = 168,
   workspaceId: number = 1,
-): EvalResult {
-  const db = getDatabase()
+): Promise<EvalResult> {
+  const prisma = getPrismaClient()
   const since = Math.floor(Date.now() / 1000) - hours * 3600
 
-  const row = db.prepare(`
-    SELECT
-      COUNT(*) as total,
-      SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) as successful,
-      AVG(CASE WHEN feedback_rating IS NOT NULL THEN feedback_rating ELSE NULL END) as avg_rating
-    FROM tasks
-    WHERE assigned_to = ? AND workspace_id = ? AND status = 'done' AND created_at > ?
-  `).get(agentName, workspaceId, since) as any
+  return (async () => {
+    const [total, successful, agg] = await Promise.all([
+      prisma.tasks.count({
+        where: { assigned_to: agentName, workspace_id: workspaceId, status: 'done', created_at: { gt: since } },
+      }),
+      prisma.tasks.count({
+        where: {
+          assigned_to: agentName,
+          workspace_id: workspaceId,
+          status: 'done',
+          created_at: { gt: since },
+          outcome: 'success',
+        },
+      }),
+      prisma.tasks.aggregate({
+        where: { assigned_to: agentName, workspace_id: workspaceId, status: 'done', created_at: { gt: since } },
+        _avg: { feedback_rating: true },
+      }),
+    ])
 
-  const total = row?.total ?? 0
-  const successful = row?.successful ?? 0
   const successRate = total > 0 ? successful / total : 1.0
-  const avgRating = row?.avg_rating
+  const avgRating = agg?._avg?.feedback_rating
   // Blend success rate with feedback rating if available (normalized to 0-1 assuming 1-5 scale)
   const score = avgRating != null
     ? (successRate * 0.6 + ((avgRating - 1) / 4) * 0.4)
@@ -92,17 +101,18 @@ export function evalCorrectnessScore(
     passed: score >= 0.6,
     detail: `Correctness: ${(score * 100).toFixed(0)}% (${successful}/${total} successful${avgRating != null ? `, avg rating ${avgRating.toFixed(1)}` : ''})`,
   }
+  })()
 }
 
 export function runOutputEvals(
   agentName: string,
   hours: number = 168,
   workspaceId: number = 1,
-): EvalResult[] {
-  return [
+): Promise<EvalResult[]> {
+  return Promise.all([
     evalTaskCompletion(agentName, hours, workspaceId),
     evalCorrectnessScore(agentName, hours, workspaceId),
-  ]
+  ])
 }
 
 // ---------------------------------------------------------------------------
@@ -126,21 +136,23 @@ export function evalReasoningCoherence(
   agentName: string,
   hours: number = 24,
   workspaceId: number = 1,
-): EvalResult {
-  const db = getDatabase()
+): Promise<EvalResult> {
+  const prisma = getPrismaClient()
   const since = Math.floor(Date.now() / 1000) - hours * 3600
 
-  const row = db.prepare(`
-    SELECT
-      COUNT(*) as total_calls,
-      COUNT(DISTINCT tool_name) as unique_tools
-    FROM mcp_call_log
-    WHERE agent_name = ? AND workspace_id = ? AND created_at > ?
-  `).get(agentName, workspaceId, since) as any
-
-  const total = row?.total_calls ?? 0
-  const unique = row?.unique_tools ?? 0
-  const { score, looping } = convergenceScore(total, unique)
+	return (async () => {
+	    const [total, uniqueRows] = await Promise.all([
+	      prisma.mcp_call_log.count({
+	        where: { agent_name: agentName, workspace_id: workspaceId, created_at: { gt: since } },
+	      }),
+	      prisma.mcp_call_log.findMany({
+	        where: { agent_name: agentName, workspace_id: workspaceId, created_at: { gt: since }, tool_name: { not: null } },
+	        distinct: ['tool_name'],
+	        select: { tool_name: true },
+	      }),
+	    ])
+	  const unique = uniqueRows.length
+	  const { score, looping } = convergenceScore(total, unique)
 
   return {
     layer: 'trace',
@@ -148,6 +160,7 @@ export function evalReasoningCoherence(
     passed: !looping,
     detail: `Convergence: ${total} calls across ${unique} unique tools (ratio ${unique > 0 ? (total / unique).toFixed(1) : 'N/A'})${looping ? ' — LOOPING DETECTED' : ''}`,
   }
+  })()
 }
 
 // ---------------------------------------------------------------------------
@@ -158,20 +171,19 @@ export function evalToolReliability(
   agentName: string,
   hours: number = 24,
   workspaceId: number = 1,
-): EvalResult {
-  const db = getDatabase()
+): Promise<EvalResult> {
+  const prisma = getPrismaClient()
   const since = Math.floor(Date.now() / 1000) - hours * 3600
 
-  const row = db.prepare(`
-    SELECT
-      COUNT(*) as total,
-      SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successes
-    FROM mcp_call_log
-    WHERE agent_name = ? AND workspace_id = ? AND created_at > ?
-  `).get(agentName, workspaceId, since) as any
-
-  const total = row?.total ?? 0
-  const successes = row?.successes ?? 0
+  return (async () => {
+    const [total, successes] = await Promise.all([
+      prisma.mcp_call_log.count({
+        where: { agent_name: agentName, workspace_id: workspaceId, created_at: { gt: since } },
+      }),
+      prisma.mcp_call_log.count({
+        where: { agent_name: agentName, workspace_id: workspaceId, created_at: { gt: since }, success: 1 },
+      }),
+    ])
   const score = total > 0 ? successes / total : 1.0
 
   return {
@@ -180,6 +192,7 @@ export function evalToolReliability(
     passed: score >= 0.8,
     detail: `Tool reliability: ${successes}/${total} successful (${(score * 100).toFixed(0)}%)`,
   }
+  })()
 }
 
 // ---------------------------------------------------------------------------
@@ -210,8 +223,8 @@ export function checkDrift(
 export function runDriftCheck(
   agentName: string,
   workspaceId: number = 1,
-): DriftResult[] {
-  const db = getDatabase()
+): Promise<DriftResult[]> {
+  const prisma = getPrismaClient()
   const now = Math.floor(Date.now() / 1000)
   const oneWeek = 7 * 86400
   const fourWeeks = 4 * 7 * 86400
@@ -222,124 +235,113 @@ export function runDriftCheck(
   const baselineStart = now - fourWeeks
   const baselineEnd = currentStart
 
-  // Metric: avg tokens per session
-  const currentTokens = db.prepare(`
-    SELECT AVG(input_tokens + output_tokens) as avg_tokens
-    FROM token_usage
-    WHERE agent_name = ? AND created_at > ?
-  `).get(agentName, currentStart) as any
+  return (async () => {
+    // Metric: avg tokens per session
+    const [currentTokens, baselineTokens] = await Promise.all([
+      prisma.token_usage.aggregate({
+        where: { agent_name: agentName, created_at: { gt: currentStart } },
+        _avg: { input_tokens: true, output_tokens: true },
+      }),
+      prisma.token_usage.aggregate({
+        where: { agent_name: agentName, created_at: { gt: baselineStart, lte: baselineEnd } },
+        _avg: { input_tokens: true, output_tokens: true },
+      }),
+    ])
 
-  const baselineTokens = db.prepare(`
-    SELECT AVG(input_tokens + output_tokens) as avg_tokens
-    FROM token_usage
-    WHERE agent_name = ? AND created_at > ? AND created_at <= ?
-  `).get(agentName, baselineStart, baselineEnd) as any
+    const currentAvgTokens = (currentTokens?._avg?.input_tokens ?? 0) + (currentTokens?._avg?.output_tokens ?? 0)
+    const baselineAvgTokens = (baselineTokens?._avg?.input_tokens ?? 0) + (baselineTokens?._avg?.output_tokens ?? 0)
+    const tokenDrift = checkDrift(currentAvgTokens, baselineAvgTokens)
+    tokenDrift.metric = 'avg_tokens_per_session'
 
-  const tokenDrift = checkDrift(
-    currentTokens?.avg_tokens ?? 0,
-    baselineTokens?.avg_tokens ?? 0,
-  )
-  tokenDrift.metric = 'avg_tokens_per_session'
+    // Metric: tool success rate
+    const [currentToolTotal, currentToolSuccess, baselineToolTotal, baselineToolSuccess] = await Promise.all([
+      prisma.mcp_call_log.count({
+        where: { agent_name: agentName, workspace_id: workspaceId, created_at: { gt: currentStart } },
+      }),
+      prisma.mcp_call_log.count({
+        where: { agent_name: agentName, workspace_id: workspaceId, created_at: { gt: currentStart }, success: 1 },
+      }),
+      prisma.mcp_call_log.count({
+        where: { agent_name: agentName, workspace_id: workspaceId, created_at: { gt: baselineStart, lte: baselineEnd } },
+      }),
+      prisma.mcp_call_log.count({
+        where: { agent_name: agentName, workspace_id: workspaceId, created_at: { gt: baselineStart, lte: baselineEnd }, success: 1 },
+      }),
+    ])
 
-  // Metric: tool success rate
-  const currentTools = db.prepare(`
-    SELECT
-      COUNT(*) as total,
-      SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successes
-    FROM mcp_call_log
-    WHERE agent_name = ? AND workspace_id = ? AND created_at > ?
-  `).get(agentName, workspaceId, currentStart) as any
+    const currentSuccessRate = currentToolTotal > 0 ? currentToolSuccess / currentToolTotal : 1.0
+    const baselineSuccessRate = baselineToolTotal > 0 ? baselineToolSuccess / baselineToolTotal : 1.0
+    const toolDrift = checkDrift(currentSuccessRate, baselineSuccessRate)
+    toolDrift.metric = 'tool_success_rate'
 
-  const baselineTools = db.prepare(`
-    SELECT
-      COUNT(*) as total,
-      SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successes
-    FROM mcp_call_log
-    WHERE agent_name = ? AND workspace_id = ? AND created_at > ? AND created_at <= ?
-  `).get(agentName, workspaceId, baselineStart, baselineEnd) as any
+    // Metric: task completion rate
+    const [currentTaskTotal, currentTaskDone, baselineTaskTotal, baselineTaskDone] = await Promise.all([
+      prisma.tasks.count({
+        where: { assigned_to: agentName, workspace_id: workspaceId, created_at: { gt: currentStart } },
+      }),
+      prisma.tasks.count({
+        where: { assigned_to: agentName, workspace_id: workspaceId, created_at: { gt: currentStart }, status: 'done' },
+      }),
+      prisma.tasks.count({
+        where: { assigned_to: agentName, workspace_id: workspaceId, created_at: { gt: baselineStart, lte: baselineEnd } },
+      }),
+      prisma.tasks.count({
+        where: { assigned_to: agentName, workspace_id: workspaceId, created_at: { gt: baselineStart, lte: baselineEnd }, status: 'done' },
+      }),
+    ])
 
-  const currentSuccessRate = (currentTools?.total ?? 0) > 0
-    ? (currentTools.successes / currentTools.total)
-    : 1.0
-  const baselineSuccessRate = (baselineTools?.total ?? 0) > 0
-    ? (baselineTools.successes / baselineTools.total)
-    : 1.0
+    const currentCompletionRate = currentTaskTotal > 0 ? currentTaskDone / currentTaskTotal : 1.0
+    const baselineCompletionRate = baselineTaskTotal > 0 ? baselineTaskDone / baselineTaskTotal : 1.0
+    const taskDrift = checkDrift(currentCompletionRate, baselineCompletionRate)
+    taskDrift.metric = 'task_completion_rate'
 
-  const toolDrift = checkDrift(currentSuccessRate, baselineSuccessRate)
-  toolDrift.metric = 'tool_success_rate'
-
-  // Metric: task completion rate
-  const currentTasks = db.prepare(`
-    SELECT
-      COUNT(*) as total,
-      SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) as completed
-    FROM tasks
-    WHERE assigned_to = ? AND workspace_id = ? AND created_at > ?
-  `).get(agentName, workspaceId, currentStart) as any
-
-  const baselineTasks = db.prepare(`
-    SELECT
-      COUNT(*) as total,
-      SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) as completed
-    FROM tasks
-    WHERE assigned_to = ? AND workspace_id = ? AND created_at > ? AND created_at <= ?
-  `).get(agentName, workspaceId, baselineStart, baselineEnd) as any
-
-  const currentCompletionRate = (currentTasks?.total ?? 0) > 0
-    ? (currentTasks.completed / currentTasks.total)
-    : 1.0
-  const baselineCompletionRate = (baselineTasks?.total ?? 0) > 0
-    ? (baselineTasks.completed / baselineTasks.total)
-    : 1.0
-
-  const taskDrift = checkDrift(currentCompletionRate, baselineCompletionRate)
-  taskDrift.metric = 'task_completion_rate'
-
-  return [tokenDrift, toolDrift, taskDrift]
+    return [tokenDrift, toolDrift, taskDrift]
+  })()
 }
 
 export function getDriftTimeline(
   agentName: string,
   weeks: number = 8,
   workspaceId: number = 1,
-): Array<{ weekStart: number; avgTokens: number; successRate: number; completionRate: number }> {
-  const db = getDatabase()
+): Promise<Array<{ weekStart: number; avgTokens: number; successRate: number; completionRate: number }>> {
+  const prisma = getPrismaClient()
   const now = Math.floor(Date.now() / 1000)
   const timeline: Array<{ weekStart: number; avgTokens: number; successRate: number; completionRate: number }> = []
 
-  for (let i = weeks - 1; i >= 0; i--) {
-    const weekStart = now - (i + 1) * 7 * 86400
-    const weekEnd = now - i * 7 * 86400
+  return (async () => {
+    for (let i = weeks - 1; i >= 0; i--) {
+      const weekStart = now - (i + 1) * 7 * 86400
+      const weekEnd = now - i * 7 * 86400
 
-    const tokens = db.prepare(`
-      SELECT AVG(input_tokens + output_tokens) as avg_tokens
-      FROM token_usage
-      WHERE agent_name = ? AND created_at > ? AND created_at <= ?
-    `).get(agentName, weekStart, weekEnd) as any
+      const [tokensAgg, toolTotal, toolSuccess, taskTotal, taskDone] = await Promise.all([
+        prisma.token_usage.aggregate({
+          where: { agent_name: agentName, created_at: { gt: weekStart, lte: weekEnd } },
+          _avg: { input_tokens: true, output_tokens: true },
+        }),
+        prisma.mcp_call_log.count({
+          where: { agent_name: agentName, workspace_id: workspaceId, created_at: { gt: weekStart, lte: weekEnd } },
+        }),
+        prisma.mcp_call_log.count({
+          where: { agent_name: agentName, workspace_id: workspaceId, created_at: { gt: weekStart, lte: weekEnd }, success: 1 },
+        }),
+        prisma.tasks.count({
+          where: { assigned_to: agentName, workspace_id: workspaceId, created_at: { gt: weekStart, lte: weekEnd } },
+        }),
+        prisma.tasks.count({
+          where: { assigned_to: agentName, workspace_id: workspaceId, created_at: { gt: weekStart, lte: weekEnd }, status: 'done' },
+        }),
+      ])
 
-    const tools = db.prepare(`
-      SELECT
-        COUNT(*) as total,
-        SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successes
-      FROM mcp_call_log
-      WHERE agent_name = ? AND workspace_id = ? AND created_at > ? AND created_at <= ?
-    `).get(agentName, workspaceId, weekStart, weekEnd) as any
+      const avgTokens = (tokensAgg?._avg?.input_tokens ?? 0) + (tokensAgg?._avg?.output_tokens ?? 0)
 
-    const tasks = db.prepare(`
-      SELECT
-        COUNT(*) as total,
-        SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) as completed
-      FROM tasks
-      WHERE assigned_to = ? AND workspace_id = ? AND created_at > ? AND created_at <= ?
-    `).get(agentName, workspaceId, weekStart, weekEnd) as any
+      timeline.push({
+        weekStart,
+        avgTokens: Math.round(avgTokens),
+        successRate: toolTotal > 0 ? Math.round((toolSuccess / toolTotal) * 10000) / 100 : 100,
+        completionRate: taskTotal > 0 ? Math.round((taskDone / taskTotal) * 10000) / 100 : 100,
+      })
+    }
 
-    timeline.push({
-      weekStart,
-      avgTokens: Math.round(tokens?.avg_tokens ?? 0),
-      successRate: (tools?.total ?? 0) > 0 ? Math.round((tools.successes / tools.total) * 10000) / 100 : 100,
-      completionRate: (tasks?.total ?? 0) > 0 ? Math.round((tasks.completed / tasks.total) * 10000) / 100 : 100,
-    })
-  }
-
-  return timeline
+    return timeline
+  })()
 }

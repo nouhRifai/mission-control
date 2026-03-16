@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getDatabase } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { syncClaudeSessions } from '@/lib/claude-sessions'
 import { logger } from '@/lib/logger'
+import { getPrismaClient } from '@/lib/prisma'
 
 /**
  * GET /api/claude/sessions — List discovered local Claude Code sessions
@@ -14,11 +14,11 @@ import { logger } from '@/lib/logger'
  *   offset=0       — pagination offset
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const { searchParams } = new URL(request.url)
 
     const active = searchParams.get('active')
@@ -26,37 +26,19 @@ export async function GET(request: NextRequest) {
     const limit = Math.min(parseInt(searchParams.get('limit') || '50'), 200)
     const offset = parseInt(searchParams.get('offset') || '0')
 
-    let query = 'SELECT * FROM claude_sessions WHERE 1=1'
-    const params: any[] = []
+    const where: any = {}
+    if (active === '1') where.is_active = 1
+    if (project) where.project_slug = project
 
-    if (active === '1') {
-      query += ' AND is_active = 1'
-    }
-
-    if (project) {
-      query += ' AND project_slug = ?'
-      params.push(project)
-    }
-
-    query += ' ORDER BY last_message_at DESC LIMIT ? OFFSET ?'
-    params.push(limit, offset)
-
-    const sessions = db.prepare(query).all(...params)
-
-    // Get total count
-    let countQuery = 'SELECT COUNT(*) as total FROM claude_sessions WHERE 1=1'
-    const countParams: any[] = []
-    if (active === '1') {
-      countQuery += ' AND is_active = 1'
-    }
-    if (project) {
-      countQuery += ' AND project_slug = ?'
-      countParams.push(project)
-    }
-    const { total } = db.prepare(countQuery).get(...countParams) as { total: number }
-
-    // Aggregate stats
-    const stats = db.prepare(`
+    const [sessions, total, statsRows] = await Promise.all([
+      prisma.claude_sessions.findMany({
+        where,
+        orderBy: { last_message_at: 'desc' },
+        take: limit,
+        skip: offset,
+      }),
+      prisma.claude_sessions.count({ where }),
+      prisma.$queryRaw<any[]>`
       SELECT
         COUNT(*) as total_sessions,
         SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) as active_sessions,
@@ -65,18 +47,20 @@ export async function GET(request: NextRequest) {
         SUM(estimated_cost) as total_estimated_cost,
         COUNT(DISTINCT project_slug) as unique_projects
       FROM claude_sessions
-    `).get() as any
+    `,
+    ])
+    const stats = statsRows?.[0] ?? {}
 
     return NextResponse.json({
       sessions,
       total,
       stats: {
-        total_sessions: stats.total_sessions || 0,
-        active_sessions: stats.active_sessions || 0,
-        total_input_tokens: stats.total_input_tokens || 0,
-        total_output_tokens: stats.total_output_tokens || 0,
-        total_estimated_cost: Math.round((stats.total_estimated_cost || 0) * 100) / 100,
-        unique_projects: stats.unique_projects || 0,
+        total_sessions: Number(stats.total_sessions || 0),
+        active_sessions: Number(stats.active_sessions || 0),
+        total_input_tokens: Number(stats.total_input_tokens || 0),
+        total_output_tokens: Number(stats.total_output_tokens || 0),
+        total_estimated_cost: Math.round(Number(stats.total_estimated_cost || 0) * 100) / 100,
+        unique_projects: Number(stats.unique_projects || 0),
       },
     })
   } catch (error) {
@@ -89,7 +73,7 @@ export async function GET(request: NextRequest) {
  * POST /api/claude/sessions — Trigger a manual scan of local Claude sessions
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {

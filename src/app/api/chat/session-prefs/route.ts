@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getDatabase } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { logger } from '@/lib/logger'
+import { getPrismaClient } from '@/lib/prisma'
 
 const PREFS_KEY = 'chat.session_prefs.v1'
 const ALLOWED_COLORS = new Set(['slate', 'blue', 'green', 'amber', 'red', 'purple', 'pink', 'teal'])
@@ -13,9 +13,12 @@ type SessionPref = {
 
 type SessionPrefs = Record<string, SessionPref>
 
-function loadPrefs(): SessionPrefs {
-  const db = getDatabase()
-  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(PREFS_KEY) as { value: string } | undefined
+async function loadPrefs(): Promise<SessionPrefs> {
+  const prisma = getPrismaClient()
+  const row = await prisma.settings.findUnique({
+    where: { key: PREFS_KEY },
+    select: { value: true },
+  })
   if (!row?.value) return {}
   try {
     const parsed = JSON.parse(row.value)
@@ -25,32 +28,34 @@ function loadPrefs(): SessionPrefs {
   }
 }
 
-function savePrefs(prefs: SessionPrefs, username: string) {
-  const db = getDatabase()
+async function savePrefs(prefs: SessionPrefs, username: string) {
+  const prisma = getPrismaClient()
   const now = Math.floor(Date.now() / 1000)
-  db.prepare(`
-    INSERT INTO settings (key, value, description, category, updated_by, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(key) DO UPDATE SET
-      value = excluded.value,
-      updated_by = excluded.updated_by,
-      updated_at = excluded.updated_at
-  `).run(
-    PREFS_KEY,
-    JSON.stringify(prefs),
-    'Chat local session preferences (rename + color tags)',
-    'chat',
-    username,
-    now,
-  )
+  await prisma.settings.upsert({
+    where: { key: PREFS_KEY },
+    create: {
+      key: PREFS_KEY,
+      value: JSON.stringify(prefs),
+      description: 'Chat local session preferences (rename + color tags)',
+      category: 'chat',
+      updated_by: username,
+      updated_at: now,
+    } as any,
+    update: {
+      value: JSON.stringify(prefs),
+      updated_by: username,
+      updated_at: now,
+    } as any,
+    select: { key: true },
+  })
 }
 
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    return NextResponse.json({ prefs: loadPrefs() })
+    return NextResponse.json({ prefs: await loadPrefs() })
   } catch (error) {
     logger.error({ err: error }, 'GET /api/chat/session-prefs error')
     return NextResponse.json({ error: 'Failed to load preferences' }, { status: 500 })
@@ -62,7 +67,7 @@ export async function GET(request: NextRequest) {
  * Body: { key: "claude-code:<sessionId>", name?: string, color?: string | null }
  */
 export async function PATCH(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
@@ -82,7 +87,7 @@ export async function PATCH(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid color' }, { status: 400 })
     }
 
-    const prefs = loadPrefs()
+    const prefs = await loadPrefs()
     const existing = prefs[key] || {}
     const updated: SessionPref = {
       ...existing,
@@ -96,7 +101,7 @@ export async function PATCH(request: NextRequest) {
       prefs[key] = updated
     }
 
-    savePrefs(prefs, auth.user.username)
+    await savePrefs(prefs, auth.user.username)
 
     return NextResponse.json({ ok: true, pref: prefs[key] || null })
   } catch (error) {

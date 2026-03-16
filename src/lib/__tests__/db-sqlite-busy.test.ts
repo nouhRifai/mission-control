@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { afterEach } from 'vitest'
 
 const { mockPragma, MockDatabase } = vi.hoisted(() => {
   const mockPragma = vi.fn()
@@ -34,20 +35,24 @@ describe('SQLite busy_timeout pragma', () => {
     vi.resetModules()
     mockPragma.mockClear()
     MockDatabase.mockClear()
+    // Force Node-like semantics so `bootstrapIfNeeded()` doesn't bail out due to jsdom's `window`.
+    vi.stubGlobal('window', undefined as any)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
   })
 
   it('sets busy_timeout = 5000 on database initialization', async () => {
-    // Fresh module import creates a new db connection
-    const { getDatabase } = await import('@/lib/db')
-    getDatabase()
+    // Fresh module import runs the SQLite bootstrap (best-effort migrations + pragmas)
+    await import('@/lib/db')
 
     const pragmaCalls = mockPragma.mock.calls.map((c) => c[0] as string)
     expect(pragmaCalls).toContain('busy_timeout = 5000')
   })
 
   it('sets WAL journal mode on database initialization', async () => {
-    const { getDatabase } = await import('@/lib/db')
-    getDatabase()
+    await import('@/lib/db')
 
     const pragmaCalls = mockPragma.mock.calls.map((c) => c[0] as string)
     expect(pragmaCalls).toContain('journal_mode = WAL')
@@ -64,6 +69,7 @@ describe('SQLite busy_timeout pragma', () => {
       expect(true).toBe(true)
     } finally {
       process.env.NEXT_PHASE = original
+      vi.unstubAllGlobals()
     }
   })
 })

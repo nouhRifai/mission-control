@@ -17,7 +17,7 @@ const MEMORY_PATH = config.memoryDir
  * - generate-moc: Auto-generate Maps of Content from file clusters
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = mutationLimiter(request)

@@ -4,12 +4,12 @@ import { logAuditEvent } from '@/lib/db'
 import { getMcSessionCookieName, getMcSessionCookieOptions, isRequestSecure, parseMcSessionCookieHeader } from '@/lib/session-cookie'
 
 export async function POST(request: Request) {
-  const user = getUserFromRequest(request)
+  const user = await getUserFromRequest(request)
   const cookieHeader = request.headers.get('cookie') || ''
   const token = parseMcSessionCookieHeader(cookieHeader)
 
   if (token) {
-    destroySession(token)
+    await destroySession(token)
   }
 
   if (user) {

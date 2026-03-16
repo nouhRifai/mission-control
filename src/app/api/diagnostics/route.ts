@@ -1,12 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server'
 import net from 'node:net'
-import { existsSync, statSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { requireRole } from '@/lib/auth'
 import { config } from '@/lib/config'
-import { getDatabase } from '@/lib/db'
+import { getDatabaseHealthSnapshot } from '@/lib/database-ops'
 import { runOpenClaw } from '@/lib/command'
 import { logger } from '@/lib/logger'
 import { APP_VERSION } from '@/lib/version'
+import { getPrismaClient } from '@/lib/prisma'
 
 const INSECURE_PASSWORDS = new Set([
   'admin',
@@ -17,7 +18,7 @@ const INSECURE_PASSWORDS = new Set([
 ])
 
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
@@ -122,72 +123,54 @@ function getSecurityInfo() {
   return { score, checks }
 }
 
-function getDatabaseInfo() {
+async function getDatabaseInfo() {
   try {
-    const db = getDatabase()
-
-    let sizeBytes = 0
-    try {
-      sizeBytes = statSync(config.dbPath).size
-    } catch {
-      // ignore
-    }
-
-    const journalRow = db.prepare('PRAGMA journal_mode').get() as { journal_mode: string } | undefined
-    const walMode = journalRow?.journal_mode === 'wal'
-
-    let migrationVersion: string | null = null
-    try {
-      const row = db.prepare(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='migrations'"
-      ).get() as { name?: string } | undefined
-      if (row?.name) {
-        const latest = db.prepare(
-          'SELECT version FROM migrations ORDER BY rowid DESC LIMIT 1'
-        ).get() as { version: string } | undefined
-        migrationVersion = latest?.version ?? null
-      }
-    } catch {
-      // migrations table may not exist
-    }
-
-    return { sizeBytes, walMode, migrationVersion }
+    return await getDatabaseHealthSnapshot()
   } catch (err) {
     logger.error({ err }, 'Diagnostics: database info error')
-    return { sizeBytes: 0, walMode: false, migrationVersion: null }
+    return { provider: config.dbProvider, sizeBytes: 0, walMode: false, migrationVersion: null, target: null }
   }
 }
 
 function getAgentInfo() {
-  try {
-    const db = getDatabase()
-    const rows = db.prepare(
-      'SELECT status, COUNT(*) as count FROM agents GROUP BY status'
-    ).all() as Array<{ status: string; count: number }>
+  return (async () => {
+    try {
+      const prisma = getPrismaClient()
+      const rows = await prisma.$queryRaw<any[]>`
+        SELECT status, COUNT(*) as count
+        FROM agents
+        GROUP BY status
+      `
 
-    const byStatus: Record<string, number> = {}
-    let total = 0
-    for (const row of rows) {
-      byStatus[row.status] = row.count
-      total += row.count
+      const byStatus: Record<string, number> = {}
+      let total = 0
+      for (const row of rows) {
+        const status = String(row.status || '')
+        const count = Number(row.count ?? 0)
+        if (!status) continue
+        byStatus[status] = count
+        total += count
+      }
+      return { total, byStatus }
+    } catch {
+      return { total: 0, byStatus: {} }
     }
-    return { total, byStatus }
-  } catch {
-    return { total: 0, byStatus: {} }
-  }
+  })()
 }
 
 function getSessionInfo() {
-  try {
-    const db = getDatabase()
-    const totalRow = db.prepare('SELECT COUNT(*) as c FROM claude_sessions').get() as { c: number } | undefined
-    const activeRow = db.prepare(
-      "SELECT COUNT(*) as c FROM claude_sessions WHERE is_active = 1"
-    ).get() as { c: number } | undefined
-    return { active: activeRow?.c ?? 0, total: totalRow?.c ?? 0 }
-  } catch {
-    return { active: 0, total: 0 }
-  }
+  return (async () => {
+    try {
+      const prisma = getPrismaClient()
+      const [total, active] = await Promise.all([
+        prisma.claude_sessions.count(),
+        prisma.claude_sessions.count({ where: { is_active: 1 } as any }),
+      ])
+      return { active, total }
+    } catch {
+      return { active: 0, total: 0 }
+    }
+  })()
 }
 
 async function getGatewayInfo() {

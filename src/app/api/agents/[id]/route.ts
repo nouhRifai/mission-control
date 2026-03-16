@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getDatabase, db_helpers, logAuditEvent } from '@/lib/db'
+import { db_helpers, logAuditEvent } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { writeAgentToConfig, enrichAgentConfigFromWorkspace, removeAgentFromConfig } from '@/lib/agent-sync'
 import { eventBus } from '@/lib/event-bus'
 import { logger } from '@/lib/logger'
 import { runOpenClaw } from '@/lib/command'
+import { getPrismaClient } from '@/lib/prisma'
 
 /**
  * GET /api/agents/[id] - Get a single agent by ID or name
@@ -13,19 +14,19 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const { id } = await params
     const workspaceId = auth.user.workspace_id ?? 1;
 
     let agent
     if (isNaN(Number(id))) {
-      agent = db.prepare('SELECT * FROM agents WHERE name = ? AND workspace_id = ?').get(id, workspaceId)
+      agent = await prisma.agents.findFirst({ where: { name: id, workspace_id: workspaceId } })
     } else {
-      agent = db.prepare('SELECT * FROM agents WHERE id = ? AND workspace_id = ?').get(Number(id), workspaceId)
+      agent = await prisma.agents.findFirst({ where: { id: Number(id), workspace_id: workspaceId } })
     }
 
     if (!agent) {
@@ -57,11 +58,11 @@ export async function PUT(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const { id } = await params
     const workspaceId = auth.user.workspace_id ?? 1;
     const body = await request.json()
@@ -69,9 +70,9 @@ export async function PUT(
 
     let agent
     if (isNaN(Number(id))) {
-      agent = db.prepare('SELECT * FROM agents WHERE name = ? AND workspace_id = ?').get(id, workspaceId) as any
+      agent = await prisma.agents.findFirst({ where: { name: id, workspace_id: workspaceId } }) as any
     } else {
-      agent = db.prepare('SELECT * FROM agents WHERE id = ? AND workspace_id = ?').get(Number(id), workspaceId) as any
+      agent = await prisma.agents.findFirst({ where: { id: Number(id), workspace_id: workspaceId } }) as any
     }
 
     if (!agent) {
@@ -106,21 +107,14 @@ export async function PUT(
     // Unified save: DB first (transactional, easy to revert), then gateway file.
     // If gateway write fails after DB succeeds, revert DB to keep consistency.
     try {
-      const fields: string[] = ['updated_at = ?']
-      const values: any[] = [now]
+      const data: any = { updated_at: now }
+      if (role !== undefined) data.role = role
+      if (gateway_config) data.config = JSON.stringify(newConfig)
 
-      if (role !== undefined) {
-        fields.push('role = ?')
-        values.push(role)
-      }
-
-      if (gateway_config) {
-        fields.push('config = ?')
-        values.push(JSON.stringify(newConfig))
-      }
-
-      values.push(agent.id, workspaceId)
-      db.prepare(`UPDATE agents SET ${fields.join(', ')} WHERE id = ? AND workspace_id = ?`).run(...values)
+      await prisma.agents.updateMany({
+        where: { id: agent.id, workspace_id: workspaceId },
+        data,
+      })
     } catch (err: any) {
       return NextResponse.json({ error: `Save failed: ${err.message}` }, { status: 500 })
     }
@@ -131,14 +125,14 @@ export async function PUT(
       } catch (err: any) {
         // Gateway write failed — revert DB to previous state
         try {
-          const revertFields: string[] = ['updated_at = ?']
-          const revertValues: any[] = [agent.updated_at]
-          revertFields.push('role = ?')
-          revertValues.push(agent.role)
-          revertFields.push('config = ?')
-          revertValues.push(agent.config || '{}')
-          revertValues.push(agent.id, workspaceId)
-          db.prepare(`UPDATE agents SET ${revertFields.join(', ')} WHERE id = ? AND workspace_id = ?`).run(...revertValues)
+          await prisma.agents.updateMany({
+            where: { id: agent.id, workspace_id: workspaceId },
+            data: {
+              updated_at: agent.updated_at,
+              role: agent.role,
+              config: agent.config || '{}',
+            } as any,
+          })
         } catch (revertErr: any) {
           logger.error({ err: revertErr, agent: agent.name }, 'Failed to revert DB after gateway write failure')
         }
@@ -200,11 +194,11 @@ export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const { id } = await params
     const workspaceId = auth.user.workspace_id ?? 1;
     let removeWorkspace = false
@@ -217,9 +211,9 @@ export async function DELETE(
 
     let agent
     if (isNaN(Number(id))) {
-      agent = db.prepare('SELECT * FROM agents WHERE name = ? AND workspace_id = ?').get(id, workspaceId) as any
+      agent = await prisma.agents.findFirst({ where: { name: id, workspace_id: workspaceId } }) as any
     } else {
-      agent = db.prepare('SELECT * FROM agents WHERE id = ? AND workspace_id = ?').get(Number(id), workspaceId) as any
+      agent = await prisma.agents.findFirst({ where: { id: Number(id), workspace_id: workspaceId } }) as any
     }
 
     if (!agent) {
@@ -258,7 +252,7 @@ export async function DELETE(
       logger.warn({ err, agent: agent.name }, 'Failed to remove OpenClaw agent config entry')
     }
 
-    db.prepare('DELETE FROM agents WHERE id = ? AND workspace_id = ?').run(agent.id, workspaceId)
+    await prisma.agents.deleteMany({ where: { id: agent.id, workspace_id: workspaceId } })
 
     db_helpers.logActivity(
       'agent_deleted',

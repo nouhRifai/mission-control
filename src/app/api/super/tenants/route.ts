@@ -6,7 +6,7 @@ import { createTenantAndBootstrapJob, listTenants } from '@/lib/super-admin'
  * GET /api/super/tenants - List tenants and latest provisioning status
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   return NextResponse.json({ tenants: listTenants() })
@@ -16,7 +16,7 @@ export async function GET(request: NextRequest) {
  * POST /api/super/tenants - Create tenant and queue bootstrap job
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {

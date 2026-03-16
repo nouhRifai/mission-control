@@ -4,8 +4,9 @@
  * instead of metadata JSON for matching.
  */
 
-import { getDatabase, db_helpers } from '@/lib/db'
+import { db_helpers } from '@/lib/db'
 import { logger } from '@/lib/logger'
+import { getPrismaClient } from '@/lib/prisma'
 import {
   fetchIssues,
   fetchIssue,
@@ -57,7 +58,7 @@ export async function pushTaskToGitHub(
   const repo = task.github_repo || project.github_repo
   if (!repo) return
 
-  const db = getDatabase()
+  const prisma = getPrismaClient()
   const now = Math.floor(Date.now() / 1000)
 
   const statusLabel = statusToLabel(task.status as TaskStatus)
@@ -89,9 +90,10 @@ export async function pushTaskToGitHub(
     })
 
     // Mark synced to prevent ping-pong
-    db.prepare(`
-      UPDATE tasks SET github_synced_at = ? WHERE id = ?
-    `).run(now, task.id)
+    await prisma.tasks.updateMany({
+      where: { id: task.id },
+      data: { github_synced_at: now },
+    })
 
     logger.info({ repo, issue: task.github_issue_number }, 'Pushed task update to GitHub')
   } else if (project.github_sync_enabled) {
@@ -105,11 +107,10 @@ export async function pushTaskToGitHub(
     })
 
     // Store the issue number and repo on the task
-    db.prepare(`
-      UPDATE tasks
-      SET github_issue_number = ?, github_repo = ?, github_synced_at = ?
-      WHERE id = ?
-    `).run(created.number, repo, now, task.id)
+    await prisma.tasks.updateMany({
+      where: { id: task.id },
+      data: { github_issue_number: created.number, github_repo: repo, github_synced_at: now },
+    })
 
     logger.info({ repo, issue: created.number, taskId: task.id }, 'Created GitHub issue for task')
   }
@@ -132,17 +133,17 @@ export async function pullFromGitHub(
     return { pulled: 0, pushed: 0 }
   }
 
-  const db = getDatabase()
+  const prisma = getPrismaClient()
   const now = Math.floor(Date.now() / 1000)
   let pulled = 0
   let pushed = 0
 
   // Find last sync time for this project
-  const lastSync = db.prepare(`
-    SELECT last_synced_at FROM github_syncs
-    WHERE project_id = ? AND workspace_id = ?
-    ORDER BY created_at DESC LIMIT 1
-  `).get(project.id, workspaceId) as { last_synced_at: number } | undefined
+  const lastSync = await prisma.github_syncs.findFirst({
+    where: { project_id: project.id, workspace_id: workspaceId },
+    orderBy: { created_at: 'desc' },
+    select: { last_synced_at: true },
+  })
 
   const sinceDate = lastSync
     ? new Date(lastSync.last_synced_at * 1000).toISOString()
@@ -159,20 +160,31 @@ export async function pullFromGitHub(
   } catch (err) {
     logger.error({ err, repo }, 'Failed to fetch issues from GitHub')
     // Record failed sync
-    db.prepare(`
-      INSERT INTO github_syncs (repo, last_synced_at, issue_count, sync_direction, status, error, project_id, changes_pushed, changes_pulled, workspace_id)
-      VALUES (?, ?, 0, 'inbound', 'error', ?, ?, 0, 0, ?)
-    `).run(repo, now, (err as Error).message, project.id, workspaceId)
+    await prisma.github_syncs.create({
+      data: {
+        repo,
+        last_synced_at: now,
+        issue_count: 0,
+        sync_direction: 'inbound',
+        status: 'error',
+        error: (err as Error).message,
+        project_id: project.id,
+        changes_pushed: 0,
+        changes_pulled: 0,
+        workspace_id: workspaceId,
+        created_at: now,
+      } as any,
+      select: { id: true },
+    })
     return { pulled: 0, pushed: 0 }
   }
 
   for (const issue of issues) {
     try {
       // Match to existing task via DB columns
-      const existingTask = db.prepare(`
-        SELECT * FROM tasks
-        WHERE github_repo = ? AND github_issue_number = ? AND workspace_id = ?
-      `).get(repo, issue.number, workspaceId) as any | undefined
+      const existingTask = await prisma.tasks.findFirst({
+        where: { github_repo: repo, github_issue_number: issue.number, workspace_id: workspaceId },
+      }) as any | null
 
       const issueUpdatedAt = Math.floor(new Date(issue.updated_at).getTime() / 1000)
       const labelNames = issue.labels.map(l => l.name)
@@ -185,27 +197,29 @@ export async function pullFromGitHub(
         const priority = labelToPriority(labelNames)
         const tags = labelNames.filter(l => !ALL_STATUS_LABEL_NAMES.includes(l) && !ALL_PRIORITY_LABEL_NAMES.includes(l))
 
-        db.prepare(`
-          INSERT INTO tasks (
-            title, description, status, priority, created_by,
-            created_at, updated_at, tags, metadata,
-            github_issue_number, github_repo, github_synced_at,
-            project_id, workspace_id
-          ) VALUES (?, ?, ?, ?, 'github-sync', ?, ?, ?, '{}', ?, ?, ?, ?, ?)
-        `).run(
-          issue.title,
-          issue.body || '',
-          status,
-          priority,
-          now, now,
-          JSON.stringify(tags),
-          issue.number, repo, now,
-          project.id, workspaceId
-        )
+        const created = await prisma.tasks.create({
+          data: {
+            title: issue.title,
+            description: issue.body || '',
+            status,
+            priority,
+            created_by: 'github-sync',
+            created_at: now,
+            updated_at: now,
+            tags: JSON.stringify(tags),
+            metadata: '{}',
+            github_issue_number: issue.number,
+            github_repo: repo,
+            github_synced_at: now,
+            project_id: project.id,
+            workspace_id: workspaceId,
+          } as any,
+          select: { id: true },
+        })
 
         pulled++
         db_helpers.logActivity(
-          'task_created', 'task', 0, 'github-sync',
+          'task_created', 'task', created.id, 'github-sync',
           `Synced from GitHub: ${repo}#${issue.number}`,
           { github_issue: issue.number, github_repo: repo },
           workspaceId
@@ -226,19 +240,17 @@ export async function pullFromGitHub(
         ) || existingTask.status)
         const priority = labelToPriority(labelNames)
 
-        db.prepare(`
-          UPDATE tasks
-          SET title = ?, description = ?, status = ?, priority = ?,
-              github_synced_at = ?, updated_at = ?
-          WHERE id = ? AND workspace_id = ?
-        `).run(
-          issue.title,
-          issue.body || '',
-          status,
-          priority,
-          now, now,
-          existingTask.id, workspaceId
-        )
+        await prisma.tasks.updateMany({
+          where: { id: existingTask.id, workspace_id: workspaceId },
+          data: {
+            title: issue.title,
+            description: issue.body || '',
+            status,
+            priority,
+            github_synced_at: now,
+            updated_at: now,
+          } as any,
+        })
 
         pulled++
         db_helpers.logActivity(
@@ -254,10 +266,21 @@ export async function pullFromGitHub(
   }
 
   // Record sync
-  db.prepare(`
-    INSERT INTO github_syncs (repo, last_synced_at, issue_count, sync_direction, status, project_id, changes_pushed, changes_pulled, workspace_id)
-    VALUES (?, ?, ?, 'inbound', 'success', ?, ?, ?, ?)
-  `).run(repo, now, pulled, project.id, pushed, pulled, workspaceId)
+  await prisma.github_syncs.create({
+    data: {
+      repo,
+      last_synced_at: now,
+      issue_count: pulled,
+      sync_direction: 'inbound',
+      status: 'success',
+      project_id: project.id,
+      changes_pushed: pushed,
+      changes_pulled: pulled,
+      workspace_id: workspaceId,
+      created_at: now,
+    } as any,
+    select: { id: true },
+  })
 
   logger.info({ repo, pulled, pushed, projectId: project.id }, 'GitHub sync completed')
 

@@ -3,7 +3,7 @@ import { execFileSync } from 'child_process'
 import { readFileSync } from 'fs'
 import { join } from 'path'
 import { requireRole } from '@/lib/auth'
-import { getDatabase } from '@/lib/db'
+import { logAuditEvent } from '@/lib/db'
 import { APP_VERSION } from '@/lib/version'
 
 const UPDATE_TIMEOUT = 5 * 60 * 1000 // 5 minutes
@@ -24,7 +24,7 @@ function pnpm(args: string[], cwd: string): string {
 }
 
 export async function POST(request: Request) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if (auth.error) {
     return NextResponse.json({ error: auth.error }, { status: auth.status })
   }
@@ -91,22 +91,12 @@ export async function POST(request: Request) {
     const newVersion: string = newPkg.version ?? targetVersion
 
     // 8. Log to audit_log
-    try {
-      const db = getDatabase()
-      db.prepare(
-        'INSERT INTO audit_log (action, actor, detail) VALUES (?, ?, ?)'
-      ).run(
-        'system.update',
-        user.username,
-        JSON.stringify({
-          previousVersion: APP_VERSION,
-          newVersion,
-          tag,
-        })
-      )
-    } catch {
-      // Non-critical -- don't fail the update if audit logging fails
-    }
+    logAuditEvent({
+      action: 'system.update',
+      actor: user.username,
+      actor_id: user.id,
+      detail: { previousVersion: APP_VERSION, newVersion, tag },
+    })
 
     return NextResponse.json({
       success: true,

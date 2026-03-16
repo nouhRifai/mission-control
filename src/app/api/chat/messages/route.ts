@@ -1,13 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getDatabase, db_helpers, Message } from '@/lib/db'
+import { db_helpers, Message } from '@/lib/db'
 import { runOpenClaw } from '@/lib/command'
 import { getAllGatewaySessions } from '@/lib/sessions'
 import { eventBus } from '@/lib/event-bus'
 import { requireRole } from '@/lib/auth'
 import { logger } from '@/lib/logger'
-import { scanForInjection, sanitizeForPrompt } from '@/lib/injection-guard'
+import { scanForInjection } from '@/lib/injection-guard'
 import { callOpenClawGateway } from '@/lib/openclaw-gateway'
 import { resolveCoordinatorDeliveryTarget } from '@/lib/coordinator-routing'
+import { getPrismaClient } from '@/lib/prisma'
 
 type ForwardInfo = {
   attempted: boolean
@@ -76,8 +77,8 @@ function safeParseMetadata(raw: string | null | undefined): any | null {
   }
 }
 
-function createChatReply(
-  db: ReturnType<typeof getDatabase>,
+async function createChatReply(
+  prisma: ReturnType<typeof getPrismaClient>,
   workspaceId: number,
   conversationId: string,
   fromAgent: string,
@@ -86,24 +87,20 @@ function createChatReply(
   messageType: 'text' | 'status' | 'tool_call' = 'status',
   metadata: Record<string, any> | null = null
 ) {
-  const replyInsert = db
-    .prepare(`
-      INSERT INTO messages (conversation_id, from_agent, to_agent, content, message_type, metadata, workspace_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `)
-    .run(
-      conversationId,
-      fromAgent,
-      toAgent,
-      content,
-      messageType,
-      metadata ? JSON.stringify(metadata) : null,
-      workspaceId
-    )
+  const now = Math.floor(Date.now() / 1000)
 
-  const row = db
-    .prepare('SELECT * FROM messages WHERE id = ? AND workspace_id = ?')
-    .get(replyInsert.lastInsertRowid, workspaceId) as Message
+  const row = (await prisma.messages.create({
+    data: {
+      conversation_id: conversationId,
+      from_agent: fromAgent,
+      to_agent: toAgent,
+      content,
+      message_type: messageType,
+      metadata: metadata ? JSON.stringify(metadata) : null,
+      workspace_id: workspaceId,
+      created_at: now,
+    } as any,
+  })) as unknown as Message
 
   eventBus.broadcast('chat.message', {
     ...row,
@@ -243,11 +240,11 @@ function extractToolEvents(waitPayload: any): ToolEvent[] {
  * Query params: conversation_id, from_agent, to_agent, limit, offset, since
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const workspaceId = auth.user.workspace_id ?? 1
     const { searchParams } = new URL(request.url)
 
@@ -258,61 +255,42 @@ export async function GET(request: NextRequest) {
     const offset = parseInt(searchParams.get('offset') || '0')
     const since = searchParams.get('since')
 
-    let query = 'SELECT * FROM messages WHERE workspace_id = ?'
-    const params: any[] = [workspaceId]
+    const where: any = { workspace_id: workspaceId }
 
     if (conversation_id) {
-      query += ' AND conversation_id = ?'
-      params.push(conversation_id)
+      where.conversation_id = conversation_id
     }
 
     if (from_agent) {
-      query += ' AND from_agent = ?'
-      params.push(from_agent)
+      where.from_agent = from_agent
     }
 
     if (to_agent) {
-      query += ' AND to_agent = ?'
-      params.push(to_agent)
+      where.to_agent = to_agent
     }
 
     if (since) {
-      query += ' AND created_at > ?'
-      params.push(parseInt(since))
+      const sinceInt = parseInt(since)
+      if (!Number.isNaN(sinceInt)) {
+        where.created_at = { gt: sinceInt }
+      }
     }
 
-    query += ' ORDER BY created_at ASC LIMIT ? OFFSET ?'
-    params.push(limit, offset)
-
-    const messages = db.prepare(query).all(...params) as Message[]
+    const messages = (await prisma.messages.findMany({
+      where,
+      orderBy: { created_at: 'asc' },
+      take: limit,
+      skip: offset,
+    })) as unknown as Message[]
 
     const parsed = messages.map((msg) => ({
       ...msg,
       metadata: safeParseMetadata(msg.metadata),
     }))
 
-    // Get total count for pagination
-    let countQuery = 'SELECT COUNT(*) as total FROM messages WHERE workspace_id = ?'
-    const countParams: any[] = [workspaceId]
-    if (conversation_id) {
-      countQuery += ' AND conversation_id = ?'
-      countParams.push(conversation_id)
-    }
-    if (from_agent) {
-      countQuery += ' AND from_agent = ?'
-      countParams.push(from_agent)
-    }
-    if (to_agent) {
-      countQuery += ' AND to_agent = ?'
-      countParams.push(to_agent)
-    }
-    if (since) {
-      countQuery += ' AND created_at > ?'
-      countParams.push(parseInt(since))
-    }
-    const countRow = db.prepare(countQuery).get(...countParams) as { total: number }
+    const total = await prisma.messages.count({ where })
 
-    return NextResponse.json({ messages: parsed, total: countRow.total, page: Math.floor(offset / limit) + 1, limit })
+    return NextResponse.json({ messages: parsed, total, page: Math.floor(offset / limit) + 1, limit })
   } catch (error) {
     logger.error({ err: error }, 'GET /api/chat/messages error')
     return NextResponse.json({ error: 'Failed to fetch messages' }, { status: 500 })
@@ -325,11 +303,11 @@ export async function GET(request: NextRequest) {
  * Sender identity is always resolved server-side from authenticated user.
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const workspaceId = auth.user.workspace_id ?? 1
     const body = await request.json()
 
@@ -366,22 +344,21 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    const stmt = db.prepare(`
-      INSERT INTO messages (conversation_id, from_agent, to_agent, content, message_type, metadata, workspace_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `)
+    const now = Math.floor(Date.now() / 1000)
+    const createdRow = (await prisma.messages.create({
+      data: {
+        conversation_id,
+        from_agent: from,
+        to_agent: to,
+        content,
+        message_type,
+        metadata: metadata ? JSON.stringify(metadata) : null,
+        workspace_id: workspaceId,
+        created_at: now,
+      },
+    })) as unknown as Message
 
-    const result = stmt.run(
-      conversation_id,
-      from,
-      to,
-      content,
-      message_type,
-      metadata ? JSON.stringify(metadata) : null,
-      workspaceId
-    )
-
-    const messageId = result.lastInsertRowid as number
+    const messageId = createdRow.id
 
     let forwardInfo: ForwardInfo | null = null
 
@@ -412,9 +389,13 @@ export async function POST(request: NextRequest) {
       if (body.forward) {
         forwardInfo = { attempted: true, delivered: false }
 
-        const agent = db
-          .prepare('SELECT * FROM agents WHERE lower(name) = lower(?) AND workspace_id = ?')
-          .get(to, workspaceId) as any
+        const agentRows = await prisma.$queryRaw<any[]>`
+          SELECT *
+          FROM agents
+          WHERE lower(name) = lower(${to}) AND workspace_id = ${workspaceId}
+          LIMIT 1
+        `
+        const agent = agentRows[0] as any
 
         const explicitSessionKey = typeof body.sessionKey === 'string' && body.sessionKey
           ? body.sessionKey
@@ -422,14 +403,16 @@ export async function POST(request: NextRequest) {
         const sessions = getAllGatewaySessions()
         const isCoordinatorSend = String(to).toLowerCase() === COORDINATOR_AGENT.toLowerCase()
         const allAgents = isCoordinatorSend
-          ? (db
-              .prepare('SELECT name, session_key, config FROM agents WHERE workspace_id = ?')
-              .all(workspaceId) as Array<{ name: string; session_key?: string | null; config?: string | null }>)
+          ? (await prisma.agents.findMany({
+              where: { workspace_id: workspaceId },
+              select: { name: true, session_key: true, config: true },
+            }))
           : []
         const configuredCoordinatorTarget = isCoordinatorSend
-          ? (db
-              .prepare("SELECT value FROM settings WHERE key = 'chat.coordinator_target_agent'")
-              .get() as { value?: string } | undefined)?.value || null
+          ? (await prisma.settings.findFirst({
+              where: { key: 'chat.coordinator_target_agent' },
+              select: { value: true },
+            }))?.value || null
           : null
 
         const coordinatorResolution = resolveCoordinatorDeliveryTarget({
@@ -471,8 +454,8 @@ export async function POST(request: NextRequest) {
           // For coordinator messages, emit an immediate visible status reply
           if (typeof conversation_id === 'string' && conversation_id.startsWith('coord:')) {
             try {
-                createChatReply(
-                  db,
+                await createChatReply(
+                  prisma,
                   workspaceId,
                   conversation_id,
                   COORDINATOR_AGENT,
@@ -553,8 +536,8 @@ export async function POST(request: NextRequest) {
               // For coordinator messages, emit visible status when send fails
               if (typeof conversation_id === 'string' && conversation_id.startsWith('coord:')) {
                 try {
-                  createChatReply(
-                    db,
+                  await createChatReply(
+                    prisma,
                     workspaceId,
                     conversation_id,
                     COORDINATOR_AGENT,
@@ -577,8 +560,8 @@ export async function POST(request: NextRequest) {
             forwardInfo.delivered
           ) {
             try {
-              createChatReply(
-                db,
+              await createChatReply(
+                prisma,
                 workspaceId,
                 conversation_id,
                 COORDINATOR_AGENT,
@@ -614,8 +597,8 @@ export async function POST(request: NextRequest) {
 
                 if (toolEvents.length > 0) {
                   for (const evt of toolEvents) {
-                    createChatReply(
-                      db,
+                    await createChatReply(
+                      prisma,
                       workspaceId,
                       conversation_id,
                       COORDINATOR_AGENT,
@@ -639,8 +622,8 @@ export async function POST(request: NextRequest) {
                     typeof waitPayload?.error === 'string'
                       ? waitPayload.error
                       : 'Unknown runtime error'
-                  createChatReply(
-                    db,
+                  await createChatReply(
+                    prisma,
                     workspaceId,
                     conversation_id,
                     COORDINATOR_AGENT,
@@ -650,8 +633,8 @@ export async function POST(request: NextRequest) {
                     { status: 'error', runId: forwardInfo.runId }
                   )
                 } else if (waitStatus === 'timeout') {
-                  createChatReply(
-                    db,
+                  await createChatReply(
+                    prisma,
                     workspaceId,
                     conversation_id,
                     COORDINATOR_AGENT,
@@ -663,8 +646,8 @@ export async function POST(request: NextRequest) {
                 } else {
                   const replyText = extractReplyText(waitPayload)
                   if (replyText) {
-                    createChatReply(
-                      db,
+                    await createChatReply(
+                      prisma,
                       workspaceId,
                       conversation_id,
                       COORDINATOR_AGENT,
@@ -674,8 +657,8 @@ export async function POST(request: NextRequest) {
                       { status: waitStatus || 'completed', runId: forwardInfo.runId }
                     )
                   } else {
-                    createChatReply(
-                      db,
+                    await createChatReply(
+                      prisma,
                       workspaceId,
                       conversation_id,
                       COORDINATOR_AGENT,
@@ -695,8 +678,8 @@ export async function POST(request: NextRequest) {
                     ? waitPayload.error
                     : (maybeWaitStderr || maybeWaitStdout || 'Unable to read completion status from coordinator runtime.').trim()
 
-                createChatReply(
-                  db,
+                await createChatReply(
+                  prisma,
                   workspaceId,
                   conversation_id,
                   COORDINATOR_AGENT,
@@ -712,11 +695,10 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    const created = db.prepare('SELECT * FROM messages WHERE id = ? AND workspace_id = ?').get(messageId, workspaceId) as Message
     const parsedMessage = {
-      ...created,
+      ...createdRow,
       metadata: {
-        ...(safeParseMetadata(created.metadata) || {}),
+        ...(safeParseMetadata(createdRow.metadata) || {}),
         forwardInfo: forwardInfo || undefined,
       },
     }

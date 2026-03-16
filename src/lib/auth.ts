@@ -1,11 +1,11 @@
 import { createHash, randomBytes, timingSafeEqual } from 'crypto'
-import { getDatabase } from './db'
 import { hashPassword, verifyPassword } from './password'
 import { logSecurityEvent } from './security-events'
 import { parseMcSessionCookieHeader } from './session-cookie'
+import { getPrismaClient } from './prisma'
 
 // Plugin hook: extensions can register a custom API key resolver without modifying this file.
-type AuthResolverHook = (apiKey: string, agentName: string | null) => User | null
+type AuthResolverHook = (apiKey: string, agentName: string | null) => User | null | Promise<User | null>
 let _authResolverHook: AuthResolverHook | null = null
 export function registerAuthResolver(hook: AuthResolverHook): void {
   _authResolverHook = hook
@@ -94,15 +94,17 @@ interface UserQueryRow {
 // Session management
 const SESSION_DURATION = 7 * 24 * 60 * 60 // 7 days in seconds
 
-function getDefaultWorkspaceContext(): { workspaceId: number; tenantId: number } {
+async function getDefaultWorkspaceContext(): Promise<{ workspaceId: number; tenantId: number }> {
   try {
-    const db = getDatabase()
-    const row = db.prepare(`
-      SELECT id, tenant_id
-      FROM workspaces
-      ORDER BY CASE WHEN slug = 'default' THEN 0 ELSE 1 END, id ASC
-      LIMIT 1
-    `).get() as { id?: number; tenant_id?: number } | undefined
+    const prisma = getPrismaClient()
+    const preferred = await prisma.workspaces.findUnique({
+      where: { slug: 'default' },
+      select: { id: true, tenant_id: true },
+    })
+    const row = preferred || await prisma.workspaces.findFirst({
+      orderBy: { id: 'asc' },
+      select: { id: true, tenant_id: true },
+    })
     return {
       workspaceId: row?.id || 1,
       tenantId: row?.tenant_id || 1,
@@ -112,94 +114,111 @@ function getDefaultWorkspaceContext(): { workspaceId: number; tenantId: number }
   }
 }
 
-export function getWorkspaceIdFromRequest(request: Request): number {
-  const user = getUserFromRequest(request)
-  return user?.workspace_id || getDefaultWorkspaceContext().workspaceId
+export async function getWorkspaceIdFromRequest(request: Request): Promise<number> {
+  const user = await getUserFromRequest(request)
+  return user?.workspace_id || (await getDefaultWorkspaceContext()).workspaceId
 }
 
-export function getTenantIdFromRequest(request: Request): number {
-  const user = getUserFromRequest(request)
-  return user?.tenant_id || getDefaultWorkspaceContext().tenantId
+export async function getTenantIdFromRequest(request: Request): Promise<number> {
+  const user = await getUserFromRequest(request)
+  return user?.tenant_id || (await getDefaultWorkspaceContext()).tenantId
 }
 
-function resolveTenantForWorkspace(workspaceId: number): number {
-  const db = getDatabase()
-  const row = db.prepare(`SELECT tenant_id FROM workspaces WHERE id = ? LIMIT 1`).get(workspaceId) as { tenant_id?: number } | undefined
-  return row?.tenant_id || getDefaultWorkspaceContext().tenantId
+async function resolveTenantForWorkspace(workspaceId: number): Promise<number> {
+  const prisma = getPrismaClient()
+  const row = await prisma.workspaces.findUnique({
+    where: { id: workspaceId },
+    select: { tenant_id: true },
+  })
+  return row?.tenant_id || (await getDefaultWorkspaceContext()).tenantId
 }
 
-export function createSession(
+export async function createSession(
   userId: number,
   ipAddress?: string,
   userAgent?: string,
   workspaceId?: number
-): { token: string; expiresAt: number } {
-  const db = getDatabase()
+): Promise<{ token: string; expiresAt: number }> {
+  const prisma = getPrismaClient()
   const token = randomBytes(32).toString('hex')
   const now = Math.floor(Date.now() / 1000)
   const expiresAt = now + SESSION_DURATION
-  const resolvedWorkspaceId = workspaceId ?? ((db.prepare('SELECT workspace_id FROM users WHERE id = ?').get(userId) as { workspace_id?: number } | undefined)?.workspace_id || getDefaultWorkspaceContext().workspaceId)
-  const resolvedTenantId = resolveTenantForWorkspace(resolvedWorkspaceId)
+  const defaultCtx = await getDefaultWorkspaceContext()
+  const user = await prisma.users.findUnique({ where: { id: userId }, select: { workspace_id: true } })
+  const resolvedWorkspaceId = workspaceId ?? user?.workspace_id ?? defaultCtx.workspaceId
+  const resolvedTenantId = await resolveTenantForWorkspace(resolvedWorkspaceId)
 
-  db.prepare(`
-    INSERT INTO user_sessions (token, user_id, expires_at, ip_address, user_agent, workspace_id, tenant_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(token, userId, expiresAt, ipAddress || null, userAgent || null, resolvedWorkspaceId, resolvedTenantId)
+  await prisma.user_sessions.create({
+    data: {
+      token,
+      user_id: userId,
+      expires_at: expiresAt,
+      ip_address: ipAddress || null,
+      user_agent: userAgent || null,
+      workspace_id: resolvedWorkspaceId,
+      tenant_id: resolvedTenantId,
+      created_at: now,
+    },
+    select: { id: true },
+  })
 
   // Update user's last login
-  db.prepare('UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?').run(now, now, userId)
+  await prisma.users.update({
+    where: { id: userId },
+    data: { last_login_at: now, updated_at: now },
+    select: { id: true },
+  })
 
   // Clean up expired sessions
-  db.prepare('DELETE FROM user_sessions WHERE expires_at < ?').run(now)
+  await prisma.user_sessions.deleteMany({ where: { expires_at: { lt: now } } })
 
   return { token, expiresAt }
 }
 
-export function validateSession(token: string): (User & { sessionId: number }) | null {
+export async function validateSession(token: string): Promise<(User & { sessionId: number }) | null> {
   if (!token) return null
-  const db = getDatabase()
+  const prisma = getPrismaClient()
   const now = Math.floor(Date.now() / 1000)
 
-  const row = db.prepare(`
-    SELECT u.id, u.username, u.display_name, u.role, u.provider, u.email, u.avatar_url, u.is_approved,
-           COALESCE(s.workspace_id, u.workspace_id, 1) as workspace_id,
-           COALESCE(s.tenant_id, w.tenant_id, 1) as tenant_id,
-           u.created_at, u.updated_at, u.last_login_at,
-           s.id as session_id
-    FROM user_sessions s
-    JOIN users u ON u.id = s.user_id
-    LEFT JOIN workspaces w ON w.id = COALESCE(s.workspace_id, u.workspace_id, 1)
-    WHERE s.token = ? AND s.expires_at > ?
-  `).get(token, now) as SessionQueryRow | undefined
+  const session = await prisma.user_sessions.findFirst({
+    where: { token, expires_at: { gt: now } },
+    include: { users: true },
+  })
 
-  if (!row) return null
+  if (!session || !session.users) return null
+  const workspaceId = session.workspace_id || session.users.workspace_id || (await getDefaultWorkspaceContext()).workspaceId
+  const workspace = await prisma.workspaces.findUnique({
+    where: { id: workspaceId },
+    select: { tenant_id: true },
+  })
+  const tenantId = session.tenant_id || workspace?.tenant_id || (await getDefaultWorkspaceContext()).tenantId
 
   return {
-    id: row.id,
-    username: row.username,
-    display_name: row.display_name,
-    role: row.role,
-    workspace_id: row.workspace_id || getDefaultWorkspaceContext().workspaceId,
-    tenant_id: row.tenant_id || getDefaultWorkspaceContext().tenantId,
-    provider: row.provider || 'local',
-    email: row.email ?? null,
-    avatar_url: row.avatar_url ?? null,
-    is_approved: typeof row.is_approved === 'number' ? row.is_approved : 1,
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-    last_login_at: row.last_login_at,
-    sessionId: row.session_id,
+    id: session.users.id,
+    username: session.users.username,
+    display_name: session.users.display_name,
+    role: session.users.role as User['role'],
+    workspace_id: workspaceId,
+    tenant_id: tenantId,
+    provider: (session.users.provider as User['provider']) || 'local',
+    email: session.users.email ?? null,
+    avatar_url: session.users.avatar_url ?? null,
+    is_approved: typeof session.users.is_approved === 'number' ? session.users.is_approved : 1,
+    created_at: session.users.created_at,
+    updated_at: session.users.updated_at,
+    last_login_at: session.users.last_login_at ?? null,
+    sessionId: session.id,
   }
 }
 
-export function destroySession(token: string): void {
-  const db = getDatabase()
-  db.prepare('DELETE FROM user_sessions WHERE token = ?').run(token)
+export async function destroySession(token: string): Promise<void> {
+  const prisma = getPrismaClient()
+  await prisma.user_sessions.deleteMany({ where: { token } })
 }
 
-export function destroyAllUserSessions(userId: number): void {
-  const db = getDatabase()
-  db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(userId)
+export async function destroyAllUserSessions(userId: number): Promise<void> {
+  const prisma = getPrismaClient()
+  await prisma.user_sessions.deleteMany({ where: { user_id: userId } })
 }
 
 // Dummy hash used for constant-time rejection when user doesn't exist.
@@ -208,36 +227,52 @@ export function destroyAllUserSessions(userId: number): void {
 const DUMMY_HASH = '0000000000000000000000000000000000000000000000000000000000000000:0000000000000000000000000000000000000000000000000000000000000000'
 
 // User management
-export function authenticateUser(username: string, password: string): User | null {
-  const db = getDatabase()
-  const row = db.prepare('SELECT * FROM users WHERE username = ?').get(username) as UserQueryRow | undefined
+export async function authenticateUser(username: string, password: string): Promise<User | null> {
+  const prisma = getPrismaClient()
+  const row = await prisma.users.findUnique({ where: { username }, select: {
+    id: true,
+    username: true,
+    display_name: true,
+    role: true,
+    provider: true,
+    provider_user_id: true,
+    email: true,
+    avatar_url: true,
+    is_approved: true,
+    workspace_id: true,
+    created_at: true,
+    updated_at: true,
+    last_login_at: true,
+    password_hash: true,
+  } }) as unknown as UserQueryRow | null
   if (!row) {
     // Always run verifyPassword to prevent timing-based username enumeration
     verifyPassword(password, DUMMY_HASH)
-    try { logSecurityEvent({ event_type: 'auth_failure', severity: 'warning', source: 'auth', detail: JSON.stringify({ username, reason: 'user_not_found' }), workspace_id: 1, tenant_id: 1 }) } catch {}
+    try { await logSecurityEvent({ event_type: 'auth_failure', severity: 'warning', source: 'auth', detail: JSON.stringify({ username, reason: 'user_not_found' }), workspace_id: 1, tenant_id: 1 }) } catch {}
     return null
   }
   if ((row.provider || 'local') !== 'local') {
     verifyPassword(password, DUMMY_HASH)
-    try { logSecurityEvent({ event_type: 'auth_failure', severity: 'warning', source: 'auth', detail: JSON.stringify({ username, reason: 'wrong_provider' }), workspace_id: 1, tenant_id: 1 }) } catch {}
+    try { await logSecurityEvent({ event_type: 'auth_failure', severity: 'warning', source: 'auth', detail: JSON.stringify({ username, reason: 'wrong_provider' }), workspace_id: 1, tenant_id: 1 }) } catch {}
     return null
   }
   if ((row.is_approved ?? 1) !== 1) {
     verifyPassword(password, DUMMY_HASH)
-    try { logSecurityEvent({ event_type: 'auth_failure', severity: 'warning', source: 'auth', detail: JSON.stringify({ username, reason: 'not_approved' }), workspace_id: 1, tenant_id: 1 }) } catch {}
+    try { await logSecurityEvent({ event_type: 'auth_failure', severity: 'warning', source: 'auth', detail: JSON.stringify({ username, reason: 'not_approved' }), workspace_id: 1, tenant_id: 1 }) } catch {}
     return null
   }
   if (!verifyPassword(password, row.password_hash)) {
-    try { logSecurityEvent({ event_type: 'auth_failure', severity: 'warning', source: 'auth', detail: JSON.stringify({ username, reason: 'invalid_password' }), workspace_id: 1, tenant_id: 1 }) } catch {}
+    try { await logSecurityEvent({ event_type: 'auth_failure', severity: 'warning', source: 'auth', detail: JSON.stringify({ username, reason: 'invalid_password' }), workspace_id: 1, tenant_id: 1 }) } catch {}
     return null
   }
+  const defaultCtx = await getDefaultWorkspaceContext()
   return {
     id: row.id,
     username: row.username,
     display_name: row.display_name,
     role: row.role,
-    workspace_id: row.workspace_id || getDefaultWorkspaceContext().workspaceId,
-    tenant_id: resolveTenantForWorkspace(row.workspace_id || getDefaultWorkspaceContext().workspaceId),
+    workspace_id: row.workspace_id || defaultCtx.workspaceId,
+    tenant_id: await resolveTenantForWorkspace(row.workspace_id || defaultCtx.workspaceId),
     provider: row.provider || 'local',
     email: row.email ?? null,
     avatar_url: row.avatar_url ?? null,
@@ -248,89 +283,135 @@ export function authenticateUser(username: string, password: string): User | nul
   }
 }
 
-export function getUserById(id: number): User | null {
-  const db = getDatabase()
-  const row = db.prepare(`
-    SELECT u.id, u.username, u.display_name, u.role, u.workspace_id, COALESCE(w.tenant_id, 1) as tenant_id,
-           u.provider, u.email, u.avatar_url, u.is_approved, u.created_at, u.updated_at, u.last_login_at
-    FROM users u
-    LEFT JOIN workspaces w ON w.id = u.workspace_id
-    WHERE u.id = ?
-  `).get(id) as User | undefined
-  return row ? { ...row, tenant_id: row.tenant_id || getDefaultWorkspaceContext().tenantId } : null
+export async function getUserById(id: number): Promise<User | null> {
+  const prisma = getPrismaClient()
+  const row = await prisma.users.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      username: true,
+      display_name: true,
+      role: true,
+      workspace_id: true,
+      provider: true,
+      email: true,
+      avatar_url: true,
+      is_approved: true,
+      created_at: true,
+      updated_at: true,
+      last_login_at: true,
+    },
+  })
+  if (!row) return null
+  const defaultCtx = await getDefaultWorkspaceContext()
+  return {
+    id: row.id,
+    username: row.username,
+    display_name: row.display_name,
+    role: row.role as User['role'],
+    workspace_id: row.workspace_id || defaultCtx.workspaceId,
+    tenant_id: await resolveTenantForWorkspace(row.workspace_id || defaultCtx.workspaceId),
+    provider: (row.provider as User['provider']) || 'local',
+    email: row.email ?? null,
+    avatar_url: row.avatar_url ?? null,
+    is_approved: row.is_approved ?? 1,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    last_login_at: row.last_login_at ?? null,
+  }
 }
 
-export function getAllUsers(): User[] {
-  const db = getDatabase()
-  return db.prepare(`
-    SELECT u.id, u.username, u.display_name, u.role, u.workspace_id, COALESCE(w.tenant_id, 1) as tenant_id,
-           u.provider, u.email, u.avatar_url, u.is_approved, u.created_at, u.updated_at, u.last_login_at
-    FROM users u
-    LEFT JOIN workspaces w ON w.id = u.workspace_id
-    ORDER BY u.created_at
-  `).all() as User[]
+export async function getAllUsers(): Promise<User[]> {
+  const prisma = getPrismaClient()
+  const rows = await prisma.users.findMany({
+    orderBy: { created_at: 'asc' },
+  })
+  const defaultCtx = await getDefaultWorkspaceContext()
+  const tenantCache = new Map<number, number>()
+  const resolveTenantCached = async (workspaceId: number) => {
+    if (tenantCache.has(workspaceId)) return tenantCache.get(workspaceId)!
+    const tenantId = await resolveTenantForWorkspace(workspaceId)
+    tenantCache.set(workspaceId, tenantId)
+    return tenantId
+  }
+
+  return Promise.all(rows.map(async (row) => ({
+    id: row.id,
+    username: row.username,
+    display_name: row.display_name,
+    role: row.role as User['role'],
+    workspace_id: row.workspace_id || defaultCtx.workspaceId,
+    tenant_id: await resolveTenantCached(row.workspace_id || defaultCtx.workspaceId),
+    provider: (row.provider as User['provider']) || 'local',
+    email: row.email ?? null,
+    avatar_url: row.avatar_url ?? null,
+    is_approved: row.is_approved ?? 1,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    last_login_at: row.last_login_at ?? null,
+  })))
 }
 
-export function createUser(
+export async function createUser(
   username: string,
   password: string,
   displayName: string,
   role: User['role'] = 'operator',
   options?: { provider?: 'local' | 'google'; provider_user_id?: string | null; email?: string | null; avatar_url?: string | null; is_approved?: 0 | 1; approved_by?: string | null; approved_at?: number | null; workspace_id?: number }
-): User {
-  const db = getDatabase()
+): Promise<User> {
+  const prisma = getPrismaClient()
   if (password.length < 12) throw new Error('Password must be at least 12 characters')
   const passwordHash = hashPassword(password)
   const provider = options?.provider || 'local'
-  const workspaceId = options?.workspace_id || getDefaultWorkspaceContext().workspaceId
-  const result = db.prepare(`
-    INSERT INTO users (username, display_name, password_hash, role, provider, provider_user_id, email, avatar_url, is_approved, approved_by, approved_at, workspace_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    username,
-    displayName,
-    passwordHash,
-    role,
-    provider,
-    options?.provider_user_id || null,
-    options?.email || null,
-    options?.avatar_url || null,
-    typeof options?.is_approved === 'number' ? options.is_approved : 1,
-    options?.approved_by || null,
-    options?.approved_at || null,
-    workspaceId,
-  )
+  const defaultCtx = await getDefaultWorkspaceContext()
+  const now = Math.floor(Date.now() / 1000)
+  const workspaceId = options?.workspace_id || defaultCtx.workspaceId
 
-  return getUserById(Number(result.lastInsertRowid))!
+  const created = await prisma.users.create({
+    data: {
+      username,
+      display_name: displayName,
+      password_hash: passwordHash,
+      role,
+      provider,
+      provider_user_id: options?.provider_user_id || null,
+      email: options?.email || null,
+      avatar_url: options?.avatar_url || null,
+      is_approved: typeof options?.is_approved === 'number' ? options.is_approved : 1,
+      approved_by: options?.approved_by || null,
+      approved_at: options?.approved_at || null,
+      workspace_id: workspaceId,
+      created_at: now,
+      updated_at: now,
+    },
+  })
+
+  return (await getUserById(created.id))!
 }
 
-export function updateUser(id: number, updates: { display_name?: string; role?: User['role']; password?: string; email?: string | null; avatar_url?: string | null; is_approved?: 0 | 1 }): User | null {
-  const db = getDatabase()
-  const fields: string[] = []
-  const params: any[] = []
+export async function updateUser(id: number, updates: { display_name?: string; role?: User['role']; password?: string; email?: string | null; avatar_url?: string | null; is_approved?: 0 | 1 }): Promise<User | null> {
+  const prisma = getPrismaClient()
+  const data: any = {}
 
-  if (updates.display_name !== undefined) { fields.push('display_name = ?'); params.push(updates.display_name) }
-  if (updates.role !== undefined) { fields.push('role = ?'); params.push(updates.role) }
-  if (updates.password !== undefined) { fields.push('password_hash = ?'); params.push(hashPassword(updates.password)) }
-  if (updates.email !== undefined) { fields.push('email = ?'); params.push(updates.email) }
-  if (updates.avatar_url !== undefined) { fields.push('avatar_url = ?'); params.push(updates.avatar_url) }
-  if (updates.is_approved !== undefined) { fields.push('is_approved = ?'); params.push(updates.is_approved) }
+  if (updates.display_name !== undefined) data.display_name = updates.display_name
+  if (updates.role !== undefined) data.role = updates.role
+  if (updates.password !== undefined) data.password_hash = hashPassword(updates.password)
+  if (updates.email !== undefined) data.email = updates.email
+  if (updates.avatar_url !== undefined) data.avatar_url = updates.avatar_url
+  if (updates.is_approved !== undefined) data.is_approved = updates.is_approved
 
-  if (fields.length === 0) return getUserById(id)
+  if (Object.keys(data).length === 0) return getUserById(id)
+  data.updated_at = Math.floor(Date.now() / 1000)
 
-  fields.push('updated_at = ?')
-  params.push(Math.floor(Date.now() / 1000))
-  params.push(id)
-
-  db.prepare(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`).run(...params)
+  await prisma.users.update({ where: { id }, data, select: { id: true } })
   return getUserById(id)
 }
 
-export function deleteUser(id: number): boolean {
-  const db = getDatabase()
-  destroyAllUserSessions(id)
-  const result = db.prepare('DELETE FROM users WHERE id = ?').run(id)
-  return result.changes > 0
+export async function deleteUser(id: number): Promise<boolean> {
+  const prisma = getPrismaClient()
+  await destroyAllUserSessions(id)
+  const result = await prisma.users.deleteMany({ where: { id } })
+  return result.count > 0
 }
 
 /**
@@ -346,54 +427,61 @@ export function deleteUser(id: number): boolean {
  * If the user does not exist and MC_PROXY_AUTH_DEFAULT_ROLE is set, auto-provisions them.
  * Auto-provisioned users receive a random unusable password — they cannot log in locally.
  */
-function resolveOrProvisionProxyUser(username: string): User | null {
+async function resolveOrProvisionProxyUserAsync(username: string): Promise<User | null> {
   try {
-    const db = getDatabase()
-    const { workspaceId } = getDefaultWorkspaceContext()
+    const prisma = getPrismaClient()
+    const defaultCtx = await getDefaultWorkspaceContext()
 
-    const row = db.prepare(`
-      SELECT u.id, u.username, u.display_name, u.role, u.workspace_id,
-             COALESCE(w.tenant_id, 1) as tenant_id,
-             u.provider, u.email, u.avatar_url, u.is_approved,
-             u.created_at, u.updated_at, u.last_login_at
-      FROM users u
-      LEFT JOIN workspaces w ON w.id = u.workspace_id
-      WHERE u.username = ?
-    `).get(username) as UserQueryRow | undefined
+    const row = await prisma.users.findUnique({
+      where: { username },
+      select: {
+        id: true,
+        username: true,
+        display_name: true,
+        role: true,
+        workspace_id: true,
+        provider: true,
+        email: true,
+        avatar_url: true,
+        is_approved: true,
+        created_at: true,
+        updated_at: true,
+        last_login_at: true,
+      },
+    })
 
     if (row) {
       if ((row.is_approved ?? 1) !== 1) return null
+      const workspaceId = row.workspace_id || defaultCtx.workspaceId
       return {
         id: row.id,
         username: row.username,
         display_name: row.display_name,
-        role: row.role,
-        workspace_id: row.workspace_id || workspaceId,
-        tenant_id: resolveTenantForWorkspace(row.workspace_id || workspaceId),
-        provider: row.provider || 'local',
+        role: row.role as User['role'],
+        workspace_id: workspaceId,
+        tenant_id: await resolveTenantForWorkspace(workspaceId),
+        provider: (row.provider as User['provider']) || 'local',
         email: row.email ?? null,
         avatar_url: row.avatar_url ?? null,
         is_approved: row.is_approved ?? 1,
         created_at: row.created_at,
         updated_at: row.updated_at,
-        last_login_at: row.last_login_at,
+        last_login_at: row.last_login_at ?? null,
       }
     }
 
-    // Auto-provision if MC_PROXY_AUTH_DEFAULT_ROLE is configured
     const defaultRole = (process.env.MC_PROXY_AUTH_DEFAULT_ROLE || '').trim()
     if (!defaultRole || !(['viewer', 'operator', 'admin'] as const).includes(defaultRole as User['role'])) {
       return null
     }
 
-    // Random password — proxy users cannot log in via the local login form
     return createUser(username, randomBytes(32).toString('hex'), username, defaultRole as User['role'])
   } catch {
     return null
   }
 }
 
-export function getUserFromRequest(request: Request): User | null {
+export async function getUserFromRequest(request: Request): Promise<User | null> {
   // Extract agent identity header (optional, for attribution)
   const agentName = (request.headers.get('x-agent-name') || '').trim() || null
 
@@ -405,7 +493,7 @@ export function getUserFromRequest(request: Request): User | null {
   if (proxyAuthHeader) {
     const proxyUsername = (request.headers.get(proxyAuthHeader) || '').trim()
     if (proxyUsername) {
-      const user = resolveOrProvisionProxyUser(proxyUsername)
+      const user = await resolveOrProvisionProxyUserAsync(proxyUsername)
       if (user) return { ...user, agent_name: agentName }
     }
   }
@@ -414,22 +502,23 @@ export function getUserFromRequest(request: Request): User | null {
   const cookieHeader = request.headers.get('cookie') || ''
   const sessionToken = parseMcSessionCookieHeader(cookieHeader)
   if (sessionToken) {
-    const user = validateSession(sessionToken)
+    const user = await validateSession(sessionToken)
     if (user) return { ...user, agent_name: agentName }
   }
 
   // Check API key - DB override first, then env var
   const apiKey = extractApiKeyFromHeaders(request.headers)
-  const configuredApiKey = resolveActiveApiKey()
+  const configuredApiKey = await resolveActiveApiKey()
 
   if (configuredApiKey && apiKey && safeCompare(apiKey, configuredApiKey)) {
+    const defaultCtx = await getDefaultWorkspaceContext()
     return {
       id: 0,
       username: 'api',
       display_name: 'API Access',
       role: 'admin',
-      workspace_id: getDefaultWorkspaceContext().workspaceId,
-      tenant_id: getDefaultWorkspaceContext().tenantId,
+      workspace_id: defaultCtx.workspaceId,
+      tenant_id: defaultCtx.tenantId,
       created_at: 0,
       updated_at: 0,
       last_login_at: null,
@@ -440,35 +529,33 @@ export function getUserFromRequest(request: Request): User | null {
   // Agent-scoped API keys
   if (apiKey) {
     try {
-      const db = getDatabase()
+      const prisma = getPrismaClient()
       const keyHash = hashApiKey(apiKey)
       const now = Math.floor(Date.now() / 1000)
-      const row = db.prepare(`
-        SELECT id, agent_id, workspace_id, scopes, expires_at, revoked_at
-        FROM agent_api_keys
-        WHERE key_hash = ?
-        LIMIT 1
-      `).get(keyHash) as {
-        id: number
-        agent_id: number
-        workspace_id: number
-        scopes: string
-        expires_at: number | null
-        revoked_at: number | null
-      } | undefined
+      const row = await prisma.agent_api_keys.findFirst({
+        where: {
+          key_hash: keyHash,
+        },
+        orderBy: { id: 'asc' },
+      })
 
       if (row && !row.revoked_at && (!row.expires_at || row.expires_at > now)) {
         const scopes = parseAgentScopes(row.scopes)
-        const agent = db
-          .prepare('SELECT id, name FROM agents WHERE id = ? AND workspace_id = ?')
-          .get(row.agent_id, row.workspace_id) as { id: number; name: string } | undefined
+        const agent = await prisma.agents.findFirst({
+          where: { id: row.agent_id, workspace_id: row.workspace_id },
+          select: { id: true, name: true },
+        })
 
         if (agent) {
           if (agentName && agentName !== agent.name && !scopes.has('admin')) {
             return null
           }
 
-          db.prepare('UPDATE agent_api_keys SET last_used_at = ?, updated_at = ? WHERE id = ?').run(now, now, row.id)
+          await prisma.agent_api_keys.update({
+            where: { id: row.id },
+            data: { last_used_at: now, updated_at: now },
+            select: { id: true },
+          })
 
           return {
             id: -row.id,
@@ -476,7 +563,7 @@ export function getUserFromRequest(request: Request): User | null {
             display_name: agent.name,
             role: deriveRoleFromScopes(scopes),
             workspace_id: row.workspace_id,
-            tenant_id: getDefaultWorkspaceContext().tenantId,
+            tenant_id: (await getDefaultWorkspaceContext()).tenantId,
             created_at: 0,
             updated_at: now,
             last_login_at: now,
@@ -491,7 +578,7 @@ export function getUserFromRequest(request: Request): User | null {
 
   // Plugin hook: allow Pro (or other extensions) to resolve custom API keys
   if (apiKey && _authResolverHook) {
-    const resolved = _authResolverHook(apiKey, agentName)
+    const resolved = await _authResolverHook(apiKey, agentName)
     if (resolved) return resolved
   }
 
@@ -501,12 +588,10 @@ export function getUserFromRequest(request: Request): User | null {
 /**
  * Resolve the active API key: check DB settings override first, then env var.
  */
-function resolveActiveApiKey(): string {
+async function resolveActiveApiKey(): Promise<string> {
   try {
-    const db = getDatabase()
-    const row = db.prepare(
-      "SELECT value FROM settings WHERE key = 'security.api_key'"
-    ).get() as { value: string } | undefined
+    const prisma = getPrismaClient()
+    const row = await prisma.settings.findUnique({ where: { key: 'security.api_key' }, select: { value: true } })
     if (row?.value) return row.value
   } catch {
     // DB not ready yet — fall back to env
@@ -565,14 +650,18 @@ const ROLE_LEVELS: Record<string, number> = { viewer: 0, operator: 1, admin: 2 }
 export function requireRole(
   request: Request,
   minRole: User['role']
-): { user: User; error?: never; status?: never } | { user?: never; error: string; status: 401 | 403 } {
-  const user = getUserFromRequest(request)
-  if (!user) {
-    return { error: 'Authentication required', status: 401 }
-  }
+): Promise<{ user: User; error?: never; status?: never } | { user?: never; error: string; status: 401 | 403 }> {
+  return requireRoleAsync(request, minRole)
+}
+
+async function requireRoleAsync(
+  request: Request,
+  minRole: User['role']
+): Promise<{ user: User; error?: never; status?: never } | { user?: never; error: string; status: 401 | 403 }> {
+  const user = await getUserFromRequest(request)
+  if (!user) return { error: 'Authentication required', status: 401 }
   if ((ROLE_LEVELS[user.role] ?? -1) < ROLE_LEVELS[minRole]) {
     return { error: `Requires ${minRole} role or higher`, status: 403 }
   }
   return { user }
 }
-

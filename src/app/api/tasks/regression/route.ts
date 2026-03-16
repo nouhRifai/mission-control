@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
 import { readLimiter } from '@/lib/rate-limit'
-import { getDatabase } from '@/lib/db'
 import { logger } from '@/lib/logger'
+import { getPrismaClient } from '@/lib/prisma'
 
 interface RegressionTaskRow {
   id: number
@@ -108,7 +108,7 @@ function buildWindowStats(
 }
 
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = readLimiter(request)
@@ -139,22 +139,22 @@ export async function GET(request: NextRequest) {
     const baselineEnd = betaStart
     const baselineStart = Math.max(0, baselineEnd - baselineDuration)
 
-    const db = getDatabase()
-    const rows = db.prepare(`
-      SELECT
-        id,
-        created_at,
-        completed_at,
-        retry_count,
-        outcome,
-        error_message
-      FROM tasks
-      WHERE workspace_id = ?
-        AND status = 'done'
-        AND completed_at IS NOT NULL
-        AND completed_at >= ?
-        AND completed_at < ?
-    `).all(workspaceId, baselineStart, postEnd) as RegressionTaskRow[]
+    const prisma = getPrismaClient()
+    const rows = (await prisma.tasks.findMany({
+      where: {
+        workspace_id: workspaceId,
+        status: 'done',
+        completed_at: { not: null, gte: baselineStart, lt: postEnd },
+      },
+      select: {
+        id: true,
+        created_at: true,
+        completed_at: true,
+        retry_count: true,
+        outcome: true,
+        error_message: true,
+      },
+    })) as RegressionTaskRow[]
 
     const baseline = buildWindowStats('baseline', baselineStart, baselineEnd, rows)
     const post = buildWindowStats('post', postStart, postEnd, rows)

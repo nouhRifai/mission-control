@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getDatabase } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { randomBytes } from 'crypto'
 import { mutationLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
 import { validateBody, createWebhookSchema } from '@/lib/validation'
+import { getPrismaClient } from '@/lib/prisma'
 
 const WEBHOOK_BLOCKED_HOSTNAMES = new Set([
   'localhost', '127.0.0.1', '::1', '0.0.0.0',
@@ -36,21 +36,21 @@ function isBlockedWebhookUrl(urlStr: string): boolean {
  * GET /api/webhooks - List all webhooks with delivery stats
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const workspaceId = auth.user.workspace_id ?? 1
-    const webhooks = db.prepare(`
+    const webhooks = await prisma.$queryRaw<any[]>`
       SELECT w.*,
         (SELECT COUNT(*) FROM webhook_deliveries wd WHERE wd.webhook_id = w.id AND wd.workspace_id = w.workspace_id) as total_deliveries,
         (SELECT COUNT(*) FROM webhook_deliveries wd WHERE wd.webhook_id = w.id AND wd.workspace_id = w.workspace_id AND wd.status_code BETWEEN 200 AND 299) as successful_deliveries,
         (SELECT COUNT(*) FROM webhook_deliveries wd WHERE wd.webhook_id = w.id AND wd.workspace_id = w.workspace_id AND (wd.error IS NOT NULL OR wd.status_code NOT BETWEEN 200 AND 299)) as failed_deliveries
       FROM webhooks w
-      WHERE w.workspace_id = ?
+      WHERE w.workspace_id = ${workspaceId}
       ORDER BY w.created_at DESC
-    `).all(workspaceId) as any[]
+    `
 
     // Parse events JSON, mask secret, add circuit breaker status
     const maxRetries = parseInt(process.env.MC_WEBHOOK_MAX_RETRIES || '5', 10) || 5
@@ -74,14 +74,14 @@ export async function GET(request: NextRequest) {
  * POST /api/webhooks - Create a new webhook
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = mutationLimiter(request)
   if (rateCheck) return rateCheck
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const workspaceId = auth.user.workspace_id ?? 1
     const validated = await validateBody(request, createWebhookSchema)
     if ('error' in validated) return validated.error
@@ -94,14 +94,24 @@ export async function POST(request: NextRequest) {
 
     const secret = generate_secret !== false ? randomBytes(32).toString('hex') : null
     const eventsJson = JSON.stringify(events || ['*'])
+    const now = Math.floor(Date.now() / 1000)
 
-    const dbResult = db.prepare(`
-      INSERT INTO webhooks (name, url, secret, events, created_by, workspace_id)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(name, url, secret, eventsJson, auth.user.username, workspaceId)
+    const created = await prisma.webhooks.create({
+      data: {
+        name,
+        url,
+        secret,
+        events: eventsJson,
+        created_by: auth.user.username,
+        workspace_id: workspaceId,
+        created_at: now,
+        updated_at: now,
+      } as any,
+      select: { id: true },
+    })
 
     return NextResponse.json({
-      id: dbResult.lastInsertRowid,
+      id: created.id,
       name,
       url,
       secret, // Show full secret only on creation
@@ -119,14 +129,14 @@ export async function POST(request: NextRequest) {
  * PUT /api/webhooks - Update a webhook
  */
 export async function PUT(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = mutationLimiter(request)
   if (rateCheck) return rateCheck
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const workspaceId = auth.user.workspace_id ?? 1
     const body = await request.json()
     const { id, name, url, events, enabled, regenerate_secret, reset_circuit } = body
@@ -135,7 +145,10 @@ export async function PUT(request: NextRequest) {
       return NextResponse.json({ error: 'Webhook ID is required' }, { status: 400 })
     }
 
-    const existing = db.prepare('SELECT * FROM webhooks WHERE id = ? AND workspace_id = ?').get(id, workspaceId) as any
+    const existing = await prisma.webhooks.findFirst({
+      where: { id: Number(id), workspace_id: workspaceId },
+      select: { id: true },
+    })
     if (!existing) {
       return NextResponse.json({ error: 'Webhook not found' }, { status: 404 })
     }
@@ -149,29 +162,30 @@ export async function PUT(request: NextRequest) {
       }
     }
 
-    const updates: string[] = ['updated_at = unixepoch()']
-    const params: any[] = []
+    const now = Math.floor(Date.now() / 1000)
+    const data: any = { updated_at: now }
 
-    if (name !== undefined) { updates.push('name = ?'); params.push(name) }
-    if (url !== undefined) { updates.push('url = ?'); params.push(url) }
-    if (events !== undefined) { updates.push('events = ?'); params.push(JSON.stringify(events)) }
-    if (enabled !== undefined) { updates.push('enabled = ?'); params.push(enabled ? 1 : 0) }
+    if (name !== undefined) data.name = name
+    if (url !== undefined) data.url = url
+    if (events !== undefined) data.events = JSON.stringify(events)
+    if (enabled !== undefined) data.enabled = enabled ? 1 : 0
 
     // Reset circuit breaker: clear failure count and re-enable
     if (reset_circuit) {
-      updates.push('consecutive_failures = 0')
-      updates.push('enabled = 1')
+      data.consecutive_failures = 0
+      data.enabled = 1
     }
 
     let newSecret: string | null = null
     if (regenerate_secret) {
       newSecret = randomBytes(32).toString('hex')
-      updates.push('secret = ?')
-      params.push(newSecret)
+      data.secret = newSecret
     }
 
-    params.push(id, workspaceId)
-    db.prepare(`UPDATE webhooks SET ${updates.join(', ')} WHERE id = ? AND workspace_id = ?`).run(...params)
+    await prisma.webhooks.updateMany({
+      where: { id: Number(id), workspace_id: workspaceId },
+      data,
+    })
 
     return NextResponse.json({
       success: true,
@@ -187,14 +201,14 @@ export async function PUT(request: NextRequest) {
  * DELETE /api/webhooks - Delete a webhook
  */
 export async function DELETE(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = mutationLimiter(request)
   if (rateCheck) return rateCheck
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const workspaceId = auth.user.workspace_id ?? 1
     let body: any
     try { body = await request.json() } catch { return NextResponse.json({ error: 'Request body required' }, { status: 400 }) }
@@ -204,15 +218,18 @@ export async function DELETE(request: NextRequest) {
       return NextResponse.json({ error: 'Webhook ID is required' }, { status: 400 })
     }
 
-    // Delete deliveries first (cascade should handle it, but be explicit)
-    db.prepare('DELETE FROM webhook_deliveries WHERE webhook_id = ? AND workspace_id = ?').run(id, workspaceId)
-    const result = db.prepare('DELETE FROM webhooks WHERE id = ? AND workspace_id = ?').run(id, workspaceId)
+    const webhookId = Number(id)
 
-    if (result.changes === 0) {
+    const [, result] = await prisma.$transaction([
+      prisma.webhook_deliveries.deleteMany({ where: { webhook_id: webhookId, workspace_id: workspaceId } }),
+      prisma.webhooks.deleteMany({ where: { id: webhookId, workspace_id: workspaceId } }),
+    ])
+
+    if (result.count === 0) {
       return NextResponse.json({ error: 'Webhook not found' }, { status: 404 })
     }
 
-    return NextResponse.json({ success: true, deleted: result.changes })
+    return NextResponse.json({ success: true, deleted: result.count })
   } catch (error) {
     logger.error({ err: error }, 'DELETE /api/webhooks error')
     return NextResponse.json({ error: 'Failed to delete webhook' }, { status: 500 })

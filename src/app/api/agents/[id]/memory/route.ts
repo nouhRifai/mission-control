@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDatabase, db_helpers } from '@/lib/db';
+import { db_helpers } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
 import { logger } from '@/lib/logger';
 import { config } from '@/lib/config';
@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { resolveWithin } from '@/lib/paths';
 import { getAgentWorkspaceCandidates, readAgentWorkspaceFile } from '@/lib/agent-workspace';
+import { getPrismaClient } from '@/lib/prisma';
 
 function resolveAgentWorkspacePath(workspace: string): string {
   if (isAbsolute(workspace)) return resolve(workspace)
@@ -24,11 +25,11 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'viewer');
+  const auth = await requireRole(request, 'viewer');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const resolvedParams = await params;
     const agentId = resolvedParams.id;
     const workspaceId = auth.user.workspace_id ?? 1;
@@ -36,22 +37,17 @@ export async function GET(
     // Get agent by ID or name
     let agent: any;
     if (isNaN(Number(agentId))) {
-      agent = db.prepare('SELECT * FROM agents WHERE name = ? AND workspace_id = ?').get(agentId, workspaceId);
+      agent = await prisma.agents.findFirst({
+        where: { name: agentId, workspace_id: workspaceId },
+      });
     } else {
-      agent = db.prepare('SELECT * FROM agents WHERE id = ? AND workspace_id = ?').get(Number(agentId), workspaceId);
+      agent = await prisma.agents.findFirst({
+        where: { id: Number(agentId), workspace_id: workspaceId },
+      });
     }
     
     if (!agent) {
       return NextResponse.json({ error: 'Agent not found' }, { status: 404 });
-    }
-    
-    // Check if agent has a working_memory column, if not create it
-    const columns = db.prepare("PRAGMA table_info(agents)").all();
-    const hasWorkingMemory = columns.some((col: any) => col.name === 'working_memory');
-    
-    if (!hasWorkingMemory) {
-      // Add working_memory column to agents table
-      db.exec("ALTER TABLE agents ADD COLUMN working_memory TEXT DEFAULT ''");
     }
     
     // Prefer workspace WORKING.md, fall back to DB working_memory
@@ -70,10 +66,8 @@ export async function GET(
     }
 
     // Get working memory content
-    const memoryStmt = db.prepare(`SELECT working_memory FROM agents WHERE ${isNaN(Number(agentId)) ? 'name' : 'id'} = ? AND workspace_id = ?`);
-    const result = memoryStmt.get(agentId, workspaceId) as any;
     if (!workingMemory) {
-      workingMemory = result?.working_memory || '';
+      workingMemory = agent.working_memory || '';
       source = workingMemory ? 'database' : 'none';
     }
     
@@ -101,11 +95,11 @@ export async function PUT(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'operator');
+  const auth = await requireRole(request, 'operator');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const resolvedParams = await params;
     const agentId = resolvedParams.id;
     const workspaceId = auth.user.workspace_id ?? 1;
@@ -115,30 +109,24 @@ export async function PUT(
     // Get agent by ID or name
     let agent: any;
     if (isNaN(Number(agentId))) {
-      agent = db.prepare('SELECT * FROM agents WHERE name = ? AND workspace_id = ?').get(agentId, workspaceId);
+      agent = await prisma.agents.findFirst({
+        where: { name: agentId, workspace_id: workspaceId },
+      });
     } else {
-      agent = db.prepare('SELECT * FROM agents WHERE id = ? AND workspace_id = ?').get(Number(agentId), workspaceId);
+      agent = await prisma.agents.findFirst({
+        where: { id: Number(agentId), workspace_id: workspaceId },
+      });
     }
     
     if (!agent) {
       return NextResponse.json({ error: 'Agent not found' }, { status: 404 });
     }
     
-    // Check if agent has a working_memory column, if not create it
-    const columns = db.prepare("PRAGMA table_info(agents)").all();
-    const hasWorkingMemory = columns.some((col: any) => col.name === 'working_memory');
-    
-    if (!hasWorkingMemory) {
-      db.exec("ALTER TABLE agents ADD COLUMN working_memory TEXT DEFAULT ''");
-    }
-    
     let newContent = working_memory || '';
     
     // Handle append mode
     if (append) {
-      const currentStmt = db.prepare(`SELECT working_memory FROM agents WHERE ${isNaN(Number(agentId)) ? 'name' : 'id'} = ? AND workspace_id = ?`);
-      const current = currentStmt.get(agentId, workspaceId) as any;
-      const currentContent = current?.working_memory || '';
+      const currentContent = agent.working_memory || '';
       
       // Add timestamp and append
       const timestamp = new Date().toISOString();
@@ -165,13 +153,11 @@ export async function PUT(
     }
     
     // Update working memory
-    const updateStmt = db.prepare(`
-      UPDATE agents 
-      SET working_memory = ?, updated_at = ?
-      WHERE ${isNaN(Number(agentId)) ? 'name' : 'id'} = ? AND workspace_id = ?
-    `);
-    
-    updateStmt.run(newContent, now, agentId, workspaceId);
+    await prisma.agents.update({
+      where: { id: agent.id },
+      data: { working_memory: newContent, updated_at: now },
+      select: { id: true },
+    });
     
     // Log activity
     db_helpers.logActivity(
@@ -210,11 +196,11 @@ export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'operator');
+  const auth = await requireRole(request, 'operator');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const resolvedParams = await params;
     const agentId = resolvedParams.id;
     const workspaceId = auth.user.workspace_id ?? 1;
@@ -222,9 +208,13 @@ export async function DELETE(
     // Get agent by ID or name
     let agent: any;
     if (isNaN(Number(agentId))) {
-      agent = db.prepare('SELECT * FROM agents WHERE name = ? AND workspace_id = ?').get(agentId, workspaceId);
+      agent = await prisma.agents.findFirst({
+        where: { name: agentId, workspace_id: workspaceId },
+      });
     } else {
-      agent = db.prepare('SELECT * FROM agents WHERE id = ? AND workspace_id = ?').get(Number(agentId), workspaceId);
+      agent = await prisma.agents.findFirst({
+        where: { id: Number(agentId), workspace_id: workspaceId },
+      });
     }
     
     if (!agent) {
@@ -248,13 +238,11 @@ export async function DELETE(
     }
     
     // Clear working memory
-    const updateStmt = db.prepare(`
-      UPDATE agents 
-      SET working_memory = '', updated_at = ?
-      WHERE ${isNaN(Number(agentId)) ? 'name' : 'id'} = ? AND workspace_id = ?
-    `);
-    
-    updateStmt.run(now, agentId, workspaceId);
+    await prisma.agents.update({
+      where: { id: agent.id },
+      data: { working_memory: '', updated_at: now },
+      select: { id: true },
+    });
     
     // Log activity
     db_helpers.logActivity(

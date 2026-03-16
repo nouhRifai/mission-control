@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
-import { getDatabase } from '@/lib/db'
 import { heavyLimiter } from '@/lib/rate-limit'
+import { getPrismaClient } from '@/lib/prisma'
 
 interface SearchResult {
   type: 'task' | 'agent' | 'activity' | 'audit' | 'message' | 'notification' | 'webhook' | 'pipeline'
@@ -18,7 +18,7 @@ interface SearchResult {
  * Global search across all MC entities.
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = heavyLimiter(request)
@@ -33,7 +33,7 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: 'Query must be at least 2 characters' }, { status: 400 })
   }
 
-  const db = getDatabase()
+  const prisma = getPrismaClient()
   const workspaceId = auth.user.workspace_id ?? 1
   const likeQ = `%${query}%`
   const results: SearchResult[] = []
@@ -41,11 +41,18 @@ export async function GET(request: NextRequest) {
   // Search tasks
   if (!typeFilter || typeFilter === 'task') {
     try {
-      const tasks = db.prepare(`
+      const tasks = await prisma.$queryRaw<any[]>`
         SELECT id, title, description, status, assigned_to, created_at
-        FROM tasks WHERE workspace_id = ? AND (title LIKE ? OR description LIKE ? OR assigned_to LIKE ?)
-        ORDER BY created_at DESC LIMIT ?
-      `).all(workspaceId, likeQ, likeQ, likeQ, limit) as any[]
+        FROM tasks
+        WHERE workspace_id = ${workspaceId}
+          AND (
+            LOWER(title) LIKE LOWER(${likeQ})
+            OR LOWER(COALESCE(description, '')) LIKE LOWER(${likeQ})
+            OR LOWER(COALESCE(assigned_to, '')) LIKE LOWER(${likeQ})
+          )
+        ORDER BY created_at DESC
+        LIMIT ${limit}
+      `
       for (const t of tasks) {
         results.push({
           type: 'task',
@@ -63,11 +70,18 @@ export async function GET(request: NextRequest) {
   // Search agents
   if (!typeFilter || typeFilter === 'agent') {
     try {
-      const agents = db.prepare(`
+      const agents = await prisma.$queryRaw<any[]>`
         SELECT id, name, role, status, last_activity, created_at
-        FROM agents WHERE workspace_id = ? AND (name LIKE ? OR role LIKE ? OR last_activity LIKE ?)
-        ORDER BY created_at DESC LIMIT ?
-      `).all(workspaceId, likeQ, likeQ, likeQ, limit) as any[]
+        FROM agents
+        WHERE workspace_id = ${workspaceId}
+          AND (
+            LOWER(name) LIKE LOWER(${likeQ})
+            OR LOWER(COALESCE(role, '')) LIKE LOWER(${likeQ})
+            OR LOWER(COALESCE(last_activity, '')) LIKE LOWER(${likeQ})
+          )
+        ORDER BY created_at DESC
+        LIMIT ${limit}
+      `
       for (const a of agents) {
         results.push({
           type: 'agent',
@@ -85,11 +99,17 @@ export async function GET(request: NextRequest) {
   // Search activities
   if (!typeFilter || typeFilter === 'activity') {
     try {
-      const activities = db.prepare(`
+      const activities = await prisma.$queryRaw<any[]>`
         SELECT id, type, actor, description, created_at
-        FROM activities WHERE workspace_id = ? AND (description LIKE ? OR actor LIKE ?)
-        ORDER BY created_at DESC LIMIT ?
-      `).all(workspaceId, likeQ, likeQ, limit) as any[]
+        FROM activities
+        WHERE workspace_id = ${workspaceId}
+          AND (
+            LOWER(description) LIKE LOWER(${likeQ})
+            OR LOWER(COALESCE(actor, '')) LIKE LOWER(${likeQ})
+          )
+        ORDER BY created_at DESC
+        LIMIT ${limit}
+      `
       for (const a of activities) {
         results.push({
           type: 'activity',
@@ -106,11 +126,15 @@ export async function GET(request: NextRequest) {
   // Search audit log (admin-only — audit_log is instance-global)
   if ((!typeFilter || typeFilter === 'audit') && auth.user.role === 'admin') {
     try {
-      const audits = db.prepare(`
+      const audits = await prisma.$queryRaw<any[]>`
         SELECT id, action, actor, detail, created_at
-        FROM audit_log WHERE action LIKE ? OR actor LIKE ? OR detail LIKE ?
-        ORDER BY created_at DESC LIMIT ?
-      `).all(likeQ, likeQ, likeQ, limit) as any[]
+        FROM audit_log
+        WHERE LOWER(action) LIKE LOWER(${likeQ})
+          OR LOWER(COALESCE(actor, '')) LIKE LOWER(${likeQ})
+          OR LOWER(COALESCE(detail, '')) LIKE LOWER(${likeQ})
+        ORDER BY created_at DESC
+        LIMIT ${limit}
+      `
       for (const a of audits) {
         results.push({
           type: 'audit',
@@ -128,11 +152,17 @@ export async function GET(request: NextRequest) {
   // Search messages
   if (!typeFilter || typeFilter === 'message') {
     try {
-      const messages = db.prepare(`
+      const messages = await prisma.$queryRaw<any[]>`
         SELECT id, from_agent, to_agent, content, conversation_id, created_at
-        FROM messages WHERE workspace_id = ? AND (content LIKE ? OR from_agent LIKE ?)
-        ORDER BY created_at DESC LIMIT ?
-      `).all(workspaceId, likeQ, likeQ, limit) as any[]
+        FROM messages
+        WHERE workspace_id = ${workspaceId}
+          AND (
+            LOWER(content) LIKE LOWER(${likeQ})
+            OR LOWER(COALESCE(from_agent, '')) LIKE LOWER(${likeQ})
+          )
+        ORDER BY created_at DESC
+        LIMIT ${limit}
+      `
       for (const m of messages) {
         results.push({
           type: 'message',
@@ -150,11 +180,17 @@ export async function GET(request: NextRequest) {
   // Search webhooks
   if (!typeFilter || typeFilter === 'webhook') {
     try {
-      const webhooks = db.prepare(`
+      const webhooks = await prisma.$queryRaw<any[]>`
         SELECT id, name, url, events, created_at
-        FROM webhooks WHERE workspace_id = ? AND (name LIKE ? OR url LIKE ?)
-        ORDER BY created_at DESC LIMIT ?
-      `).all(workspaceId, likeQ, likeQ, limit) as any[]
+        FROM webhooks
+        WHERE workspace_id = ${workspaceId}
+          AND (
+            LOWER(name) LIKE LOWER(${likeQ})
+            OR LOWER(url) LIKE LOWER(${likeQ})
+          )
+        ORDER BY created_at DESC
+        LIMIT ${limit}
+      `
       for (const w of webhooks) {
         results.push({
           type: 'webhook',
@@ -171,11 +207,17 @@ export async function GET(request: NextRequest) {
   // Search pipelines
   if (!typeFilter || typeFilter === 'pipeline') {
     try {
-      const pipelines = db.prepare(`
+      const pipelines = await prisma.$queryRaw<any[]>`
         SELECT id, name, description, created_at
-        FROM workflow_pipelines WHERE workspace_id = ? AND (name LIKE ? OR description LIKE ?)
-        ORDER BY created_at DESC LIMIT ?
-      `).all(workspaceId, likeQ, likeQ, limit) as any[]
+        FROM workflow_pipelines
+        WHERE workspace_id = ${workspaceId}
+          AND (
+            LOWER(name) LIKE LOWER(${likeQ})
+            OR LOWER(COALESCE(description, '')) LIKE LOWER(${likeQ})
+          )
+        ORDER BY created_at DESC
+        LIMIT ${limit}
+      `
       for (const p of pipelines) {
         results.push({
           type: 'pipeline',

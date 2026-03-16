@@ -202,7 +202,7 @@ async function isGatewayReachable(): Promise<boolean> {
  * Supports ?action=probe&channel=<name> to probe a specific channel
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const { searchParams } = new URL(request.url)
@@ -291,7 +291,7 @@ export async function GET(request: NextRequest) {
  * Body: { action: string, ...params }
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const body = await request.json().catch(() => null)

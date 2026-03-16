@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDatabase } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
 import { logger } from '@/lib/logger';
+import { getPrismaClient } from '@/lib/prisma';
 
 const ALLOWED_SECTIONS = new Set(['identity', 'audit', 'mutations', 'cost']);
 
@@ -26,11 +26,11 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'viewer');
+  const auth = await requireRole(request, 'viewer');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const resolvedParams = await params;
     const agentId = resolvedParams.id;
     const workspaceId = auth.user.workspace_id ?? 1;
@@ -38,9 +38,9 @@ export async function GET(
     // Resolve agent
     let agent: any;
     if (/^\d+$/.test(agentId)) {
-      agent = db.prepare('SELECT * FROM agents WHERE id = ? AND workspace_id = ?').get(Number(agentId), workspaceId);
+      agent = await prisma.agents.findFirst({ where: { id: Number(agentId), workspace_id: workspaceId } })
     } else {
-      agent = db.prepare('SELECT * FROM agents WHERE name = ? AND workspace_id = ?').get(agentId, workspaceId);
+      agent = await prisma.agents.findFirst({ where: { name: agentId, workspace_id: workspaceId } })
     }
 
     if (!agent) {
@@ -81,19 +81,19 @@ export async function GET(
     };
 
     if (sections.sections.has('identity')) {
-      result.identity = buildIdentity(db, agent, workspaceId);
+      result.identity = await buildIdentity(prisma, agent, workspaceId);
     }
 
     if (sections.sections.has('audit')) {
-      result.audit = buildAuditTrail(db, agent.name, workspaceId, since);
+      result.audit = await buildAuditTrail(prisma, agent.name, workspaceId, since);
     }
 
     if (sections.sections.has('mutations')) {
-      result.mutations = buildMutations(db, agent.name, workspaceId, since);
+      result.mutations = await buildMutations(prisma, agent.name, workspaceId, since);
     }
 
     if (sections.sections.has('cost')) {
-      result.cost = buildCostAttribution(db, agent.name, workspaceId, since);
+      result.cost = await buildCostAttribution(prisma, agent.name, workspaceId, since);
     }
 
     return NextResponse.json(result);
@@ -104,22 +104,18 @@ export async function GET(
 }
 
 /** Agent identity and profile info */
-function buildIdentity(db: any, agent: any, workspaceId: number) {
+async function buildIdentity(prisma: any, agent: any, workspaceId: number) {
   const config = safeParseJson(agent.config, {});
 
   // Count total tasks ever assigned
-  const taskStats = db.prepare(`
-    SELECT
-      COUNT(*) as total,
-      SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) as completed,
-      SUM(CASE WHEN status IN ('assigned', 'in_progress') THEN 1 ELSE 0 END) as active
-    FROM tasks WHERE assigned_to = ? AND workspace_id = ?
-  `).get(agent.name, workspaceId) as any;
-
-  // Count comments authored
-  const commentCount = (db.prepare(
-    `SELECT COUNT(*) as c FROM comments WHERE author = ? AND workspace_id = ?`
-  ).get(agent.name, workspaceId) as any).c;
+  const [total, completed, active, commentCount] = await Promise.all([
+    prisma.tasks.count({ where: { assigned_to: agent.name, workspace_id: workspaceId } }),
+    prisma.tasks.count({ where: { assigned_to: agent.name, workspace_id: workspaceId, status: 'done' } }),
+    prisma.tasks.count({
+      where: { assigned_to: agent.name, workspace_id: workspaceId, status: { in: ['assigned', 'in_progress'] } },
+    }),
+    prisma.comments.count({ where: { author: agent.name, workspace_id: workspaceId } }),
+  ])
 
   return {
     id: agent.id,
@@ -133,35 +129,36 @@ function buildIdentity(db: any, agent: any, workspaceId: number) {
     has_soul: !!agent.soul_content,
     config_keys: Object.keys(config),
     lifetime_stats: {
-      tasks_total: taskStats?.total || 0,
-      tasks_completed: taskStats?.completed || 0,
-      tasks_active: taskStats?.active || 0,
+      tasks_total: total || 0,
+      tasks_completed: completed || 0,
+      tasks_active: active || 0,
       comments_authored: commentCount,
     },
   };
 }
 
 /** Audit trail — all activities attributed to this agent */
-function buildAuditTrail(db: any, agentName: string, workspaceId: number, since: number) {
+async function buildAuditTrail(prisma: any, agentName: string, workspaceId: number, since: number) {
   // Activities where this agent is the actor
-  const activities = db.prepare(`
-    SELECT id, type, entity_type, entity_id, description, data, created_at
-    FROM activities
-    WHERE actor = ? AND workspace_id = ? AND created_at >= ?
-    ORDER BY created_at DESC
-    LIMIT 200
-  `).all(agentName, workspaceId, since) as any[];
+  const activities = await prisma.activities.findMany({
+    where: { actor: agentName, workspace_id: workspaceId, created_at: { gte: since } },
+    select: { id: true, type: true, entity_type: true, entity_id: true, description: true, data: true, created_at: true },
+    orderBy: { created_at: 'desc' },
+    take: 200,
+  })
 
   // Audit log entries (system-wide, may reference agent)
   let auditEntries: any[] = [];
   try {
-    auditEntries = db.prepare(`
-      SELECT id, action, actor, detail, created_at
-      FROM audit_log
-      WHERE (actor = ? OR detail LIKE ?) AND created_at >= ?
-      ORDER BY created_at DESC
-      LIMIT 100
-    `).all(agentName, `%${agentName}%`, since) as any[];
+    auditEntries = await prisma.audit_log.findMany({
+      where: {
+        created_at: { gte: since },
+        OR: [{ actor: agentName }, { detail: { contains: agentName } }],
+      },
+      select: { id: true, action: true, actor: true, detail: true, created_at: true },
+      orderBy: { created_at: 'desc' },
+      take: 100,
+    })
   } catch {
     // audit_log table may not exist
   }
@@ -175,11 +172,11 @@ function buildAuditTrail(db: any, agentName: string, workspaceId: number, since:
   return {
     total_activities: activities.length,
     by_type: byType,
-    activities: activities.map(a => ({
+    activities: activities.map((a: any) => ({
       ...a,
       data: safeParseJson(a.data, null),
     })),
-    audit_log_entries: auditEntries.map(e => ({
+    audit_log_entries: auditEntries.map((e: any) => ({
       ...e,
       detail: safeParseJson(e.detail, null),
     })),
@@ -187,50 +184,61 @@ function buildAuditTrail(db: any, agentName: string, workspaceId: number, since:
 }
 
 /** Mutations — task changes, comments, status transitions */
-function buildMutations(db: any, agentName: string, workspaceId: number, since: number) {
+async function buildMutations(prisma: any, agentName: string, workspaceId: number, since: number) {
   // Task mutations (created, updated, status changes)
-  const taskMutations = db.prepare(`
-    SELECT id, type, entity_type, entity_id, description, data, created_at
-    FROM activities
-    WHERE actor = ? AND workspace_id = ? AND created_at >= ?
-      AND entity_type = 'task'
-      AND type IN ('task_created', 'task_updated', 'task_status_change', 'task_assigned')
-    ORDER BY created_at DESC
-    LIMIT 100
-  `).all(agentName, workspaceId, since) as any[];
+  const taskMutations = await prisma.activities.findMany({
+    where: {
+      actor: agentName,
+      workspace_id: workspaceId,
+      created_at: { gte: since },
+      entity_type: 'task',
+      type: { in: ['task_created', 'task_updated', 'task_status_change', 'task_assigned'] },
+    },
+    select: { id: true, type: true, entity_type: true, entity_id: true, description: true, data: true, created_at: true },
+    orderBy: { created_at: 'desc' },
+    take: 100,
+  })
 
   // Comments authored
-  const comments = db.prepare(`
-    SELECT c.id, c.task_id, c.content, c.created_at, c.mentions, t.title as task_title
-    FROM comments c
-    LEFT JOIN tasks t ON c.task_id = t.id AND t.workspace_id = ?
-    WHERE c.author = ? AND c.workspace_id = ? AND c.created_at >= ?
-    ORDER BY c.created_at DESC
-    LIMIT 50
-  `).all(workspaceId, agentName, workspaceId, since) as any[];
+  const comments = await prisma.comments.findMany({
+    where: { author: agentName, workspace_id: workspaceId, created_at: { gte: since } },
+    select: {
+      id: true,
+      task_id: true,
+      content: true,
+      created_at: true,
+      mentions: true,
+      tasks: { select: { title: true } },
+    },
+    orderBy: { created_at: 'desc' },
+    take: 50,
+  })
 
   // Agent status changes (by heartbeat or others)
-  const statusChanges = db.prepare(`
-    SELECT id, type, description, data, created_at
-    FROM activities
-    WHERE entity_type = 'agent' AND workspace_id = ?
-      AND created_at >= ?
-      AND (actor = ? OR description LIKE ?)
-    ORDER BY created_at DESC
-    LIMIT 50
-  `).all(workspaceId, since, agentName, `%${agentName}%`) as any[];
+  const statusChanges = await prisma.activities.findMany({
+    where: {
+      entity_type: 'agent',
+      workspace_id: workspaceId,
+      created_at: { gte: since },
+      OR: [{ actor: agentName }, { description: { contains: agentName } }],
+    },
+    select: { id: true, type: true, description: true, data: true, created_at: true },
+    orderBy: { created_at: 'desc' },
+    take: 50,
+  })
 
   return {
-    task_mutations: taskMutations.map(m => ({
+    task_mutations: taskMutations.map((m: any) => ({
       ...m,
       data: safeParseJson(m.data, null),
     })),
-    comments: comments.map(c => ({
+    comments: comments.map((c: any) => ({
       ...c,
+      task_title: (c as any).tasks?.title ?? null,
       mentions: safeParseJson(c.mentions, []),
       content_preview: c.content?.substring(0, 200) || '',
     })),
-    status_changes: statusChanges.map(s => ({
+    status_changes: statusChanges.map((s: any) => ({
       ...s,
       data: safeParseJson(s.data, null),
     })),
@@ -243,38 +251,50 @@ function buildMutations(db: any, agentName: string, workspaceId: number, since: 
 }
 
 /** Cost attribution — token usage per model */
-function buildCostAttribution(db: any, agentName: string, workspaceId: number, since: number) {
+async function buildCostAttribution(prisma: any, agentName: string, workspaceId: number, since: number) {
   try {
-    const byModel = db.prepare(`
-      SELECT model,
-        COUNT(*) as request_count,
-        SUM(input_tokens) as input_tokens,
-        SUM(output_tokens) as output_tokens
-      FROM token_usage
-      WHERE session_id = ? AND workspace_id = ? AND created_at >= ?
-      GROUP BY model
-      ORDER BY (input_tokens + output_tokens) DESC
-    `).all(agentName, workspaceId, since) as Array<{
-      model: string; request_count: number; input_tokens: number; output_tokens: number
-    }>;
+    const [byModel, byModelAlt, dailyRows] = await Promise.all([
+      prisma.token_usage.groupBy({
+        by: ['model'],
+        where: { session_id: agentName, workspace_id: workspaceId, created_at: { gte: since } },
+        _sum: { input_tokens: true, output_tokens: true },
+        _count: { _all: true },
+      }),
+      prisma.token_usage.groupBy({
+        by: ['model'],
+        where: {
+          session_id: { startsWith: `${agentName}:` },
+          workspace_id: workspaceId,
+          created_at: { gte: since },
+        },
+        _sum: { input_tokens: true, output_tokens: true },
+        _count: { _all: true },
+      }),
+      prisma.token_usage.findMany({
+        where: {
+          workspace_id: workspaceId,
+          created_at: { gte: since },
+          OR: [{ session_id: agentName }, { session_id: { startsWith: `${agentName}:` } }],
+        },
+        select: { created_at: true, input_tokens: true, output_tokens: true },
+        orderBy: { created_at: 'asc' },
+      }),
+    ])
 
-    // Also check session IDs that contain the agent name (e.g. "agentname:cli")
-    const byModelAlt = db.prepare(`
-      SELECT model,
-        COUNT(*) as request_count,
-        SUM(input_tokens) as input_tokens,
-        SUM(output_tokens) as output_tokens
-      FROM token_usage
-      WHERE session_id LIKE ? AND session_id != ? AND workspace_id = ? AND created_at >= ?
-      GROUP BY model
-      ORDER BY (input_tokens + output_tokens) DESC
-    `).all(`${agentName}:%`, agentName, workspaceId, since) as Array<{
-      model: string; request_count: number; input_tokens: number; output_tokens: number
-    }>;
+    const normalize = (rows: any[]) =>
+      rows.map((row: any) => ({
+        model: row.model,
+        request_count: row._count?._all ?? 0,
+        input_tokens: row._sum?.input_tokens ?? 0,
+        output_tokens: row._sum?.output_tokens ?? 0,
+      }))
+
+    const byModelRows = normalize(byModel)
+    const byModelAltRows = normalize(byModelAlt)
 
     // Merge results
     const merged = new Map<string, { model: string; request_count: number; input_tokens: number; output_tokens: number }>();
-    for (const row of [...byModel, ...byModelAlt]) {
+    for (const row of [...byModelRows, ...byModelAltRows]) {
       const existing = merged.get(row.model);
       if (existing) {
         existing.request_count += row.request_count;
@@ -286,6 +306,7 @@ function buildCostAttribution(db: any, agentName: string, workspaceId: number, s
     }
 
     const models = Array.from(merged.values());
+    models.sort((a, b) => (b.input_tokens + b.output_tokens) - (a.input_tokens + a.output_tokens))
     const total = models.reduce((acc, r) => ({
       input_tokens: acc.input_tokens + r.input_tokens,
       output_tokens: acc.output_tokens + r.output_tokens,
@@ -293,16 +314,16 @@ function buildCostAttribution(db: any, agentName: string, workspaceId: number, s
     }), { input_tokens: 0, output_tokens: 0, requests: 0 });
 
     // Daily breakdown for trend
-    const daily = db.prepare(`
-      SELECT (created_at / 86400) * 86400 as day_bucket,
-        SUM(input_tokens) as input_tokens,
-        SUM(output_tokens) as output_tokens,
-        COUNT(*) as requests
-      FROM token_usage
-      WHERE (session_id = ? OR session_id LIKE ?) AND workspace_id = ? AND created_at >= ?
-      GROUP BY day_bucket
-      ORDER BY day_bucket ASC
-    `).all(agentName, `${agentName}:%`, workspaceId, since) as any[];
+    const dailyByBucket = new Map<number, { day_bucket: number; input_tokens: number; output_tokens: number; requests: number }>()
+    for (const row of dailyRows) {
+      const bucket = Math.floor(row.created_at / 86400) * 86400
+      const existing = dailyByBucket.get(bucket) ?? { day_bucket: bucket, input_tokens: 0, output_tokens: 0, requests: 0 }
+      existing.input_tokens += row.input_tokens ?? 0
+      existing.output_tokens += row.output_tokens ?? 0
+      existing.requests += 1
+      dailyByBucket.set(bucket, existing)
+    }
+    const daily = Array.from(dailyByBucket.values()).sort((a, b) => a.day_bucket - b.day_bucket)
 
     return {
       by_model: models,

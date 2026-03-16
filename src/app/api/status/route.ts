@@ -1,11 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
 import net from 'node:net'
 import os from 'node:os'
-import { existsSync, statSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { runCommand, runOpenClaw, runClawdbot } from '@/lib/command'
 import { config } from '@/lib/config'
-import { getDatabase } from '@/lib/db'
+import { getDatabaseSizeBytes, listDatabaseBackups } from '@/lib/database-ops'
 import { getAllGatewaySessions, getAgentLiveStatuses } from '@/lib/sessions'
 import { requireRole } from '@/lib/auth'
 import { MODEL_CATALOG } from '@/lib/models'
@@ -14,6 +14,7 @@ import { detectProviderSubscriptions, getPrimarySubscription } from '@/lib/provi
 import { APP_VERSION } from '@/lib/version'
 import { isHermesInstalled, scanHermesSessions } from '@/lib/hermes-sessions'
 import { registerMcAsDashboard } from '@/lib/gateway-runtime'
+import { getPrismaClient } from '@/lib/prisma'
 
 export async function GET(request: NextRequest) {
   // Docker/Kubernetes health probes must work without auth/cookies.
@@ -23,7 +24,7 @@ export async function GET(request: NextRequest) {
     return NextResponse.json(health)
   }
 
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
@@ -132,60 +133,66 @@ async function getMemorySnapshot() {
   }
 }
 
-function getDbStats(workspaceId: number) {
+async function getDbStats(workspaceId: number) {
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const now = Math.floor(Date.now() / 1000)
     const day = now - 86400
     const week = now - 7 * 86400
 
     // Task breakdown
-    const taskStats = db.prepare(`
-      SELECT status, COUNT(*) as count FROM tasks WHERE workspace_id = ? GROUP BY status
-    `).all(workspaceId) as Array<{ status: string; count: number }>
-    const tasksByStatus: Record<string, number> = {}
-    let totalTasks = 0
-    for (const row of taskStats) {
-      tasksByStatus[row.status] = row.count
-      totalTasks += row.count
-    }
+    const taskStats = await prisma.tasks.groupBy({
+      by: ['status'],
+      where: { workspace_id: workspaceId },
+      _count: { _all: true },
+    })
+    const tasksByStatus: Record<string, number> = Object.fromEntries(
+      taskStats.map((row: any) => [row.status, row._count?._all ?? 0])
+    )
+    const totalTasks = Object.values(tasksByStatus).reduce((sum, n) => sum + n, 0)
 
     // Agent breakdown
-    const agentStats = db.prepare(`
-      SELECT status, COUNT(*) as count FROM agents WHERE workspace_id = ? GROUP BY status
-    `).all(workspaceId) as Array<{ status: string; count: number }>
-    const agentsByStatus: Record<string, number> = {}
-    let totalAgents = 0
-    for (const row of agentStats) {
-      agentsByStatus[row.status] = row.count
-      totalAgents += row.count
-    }
+    const agentStats = await prisma.agents.groupBy({
+      by: ['status'],
+      where: { workspace_id: workspaceId },
+      _count: { _all: true },
+    })
+    const agentsByStatus: Record<string, number> = Object.fromEntries(
+      agentStats.map((row: any) => [row.status, row._count?._all ?? 0])
+    )
+    const totalAgents = Object.values(agentsByStatus).reduce((sum, n) => sum + n, 0)
 
     // Audit events (24h / 7d)
-    const auditDay = (db.prepare('SELECT COUNT(*) as c FROM audit_log WHERE created_at > ?').get(day) as any).c
-    const auditWeek = (db.prepare('SELECT COUNT(*) as c FROM audit_log WHERE created_at > ?').get(week) as any).c
+    const [auditDay, auditWeek] = await Promise.all([
+      prisma.audit_log.count({ where: { created_at: { gt: day } } }),
+      prisma.audit_log.count({ where: { created_at: { gt: week } } }),
+    ])
 
     // Security events (login failures in last 24h)
-    const loginFailures = (db.prepare(
-      "SELECT COUNT(*) as c FROM audit_log WHERE action = 'login_failed' AND created_at > ?"
-    ).get(day) as any).c
+    const loginFailures = await prisma.audit_log.count({
+      where: { action: 'login_failed', created_at: { gt: day } },
+    })
 
     // Activities (24h)
-    const activityDay = (
-      db.prepare('SELECT COUNT(*) as c FROM activities WHERE created_at > ? AND workspace_id = ?').get(day, workspaceId) as any
-    ).c
+    const activityDay = await prisma.activities.count({
+      where: { created_at: { gt: day }, workspace_id: workspaceId },
+    })
 
     // Notifications (unread)
-    const unreadNotifs = (
-      db.prepare('SELECT COUNT(*) as c FROM notifications WHERE read_at IS NULL AND workspace_id = ?').get(workspaceId) as any
-    ).c
+    const unreadNotifs = await prisma.notifications.count({
+      where: { read_at: null, workspace_id: workspaceId },
+    })
 
     // Pipeline runs (active + recent)
     let pipelineActive = 0
     let pipelineRecent = 0
     try {
-      pipelineActive = (db.prepare("SELECT COUNT(*) as c FROM pipeline_runs WHERE status = 'running'").get() as any).c
-      pipelineRecent = (db.prepare('SELECT COUNT(*) as c FROM pipeline_runs WHERE created_at > ?').get(day) as any).c
+      const [active, recent] = await Promise.all([
+        prisma.pipeline_runs.count({ where: { status: 'running' } }),
+        prisma.pipeline_runs.count({ where: { created_at: { gt: day } } }),
+      ])
+      pipelineActive = active
+      pipelineRecent = recent
     } catch {
       // Pipeline tables may not exist yet
     }
@@ -193,16 +200,12 @@ function getDbStats(workspaceId: number) {
     // Latest backup
     let latestBackup: { name: string; size: number; age_hours: number } | null = null
     try {
-      const { readdirSync } = require('fs')
-      const { join, dirname } = require('path')
-      const backupDir = join(dirname(config.dbPath), 'backups')
-      const files = readdirSync(backupDir)
-        .filter((f: string) => f.endsWith('.db'))
-        .map((f: string) => {
-          const stat = statSync(join(backupDir, f))
-          return { name: f, size: stat.size, mtime: stat.mtimeMs }
-        })
-        .sort((a: any, b: any) => b.mtime - a.mtime)
+      const files = listDatabaseBackups()
+        .map((file) => ({
+          name: file.name,
+          size: file.size,
+          mtime: file.created_at * 1000,
+        }))
       if (files.length > 0) {
         latestBackup = {
           name: files[0].name,
@@ -215,17 +218,12 @@ function getDbStats(workspaceId: number) {
     }
 
     // DB file size
-    let dbSizeBytes = 0
-    try {
-      dbSizeBytes = statSync(config.dbPath).size
-    } catch {
-      // ignore
-    }
+    const dbSizeBytes = getDatabaseSizeBytes()
 
     // Webhook configs count
     let webhookCount = 0
     try {
-      webhookCount = (db.prepare('SELECT COUNT(*) as c FROM webhooks').get() as any).c
+      webhookCount = await prisma.webhooks.count()
     } catch {
       // table may not exist
     }
@@ -343,25 +341,35 @@ async function getSystemStatus(workspaceId: number) {
 
     // Sync agent statuses in DB from live session data
     try {
-      const db = getDatabase()
+      const prisma = getPrismaClient()
       const liveStatuses = getAgentLiveStatuses()
       const now = Math.floor(Date.now() / 1000)
-      // Match by: exact name, lowercase, or normalized (spaces→hyphens)
-      const updateStmt = db.prepare(
-        `UPDATE agents SET status = ?, last_seen = ?, updated_at = ?
-         WHERE workspace_id = ?
-           AND (LOWER(name) = LOWER(?)
-           OR LOWER(REPLACE(name, ' ', '-')) = LOWER(?))`
-      )
+      const agents = await prisma.agents.findMany({
+        where: { workspace_id: workspaceId },
+        select: { id: true, name: true },
+      })
+
+      const normalize = (value: string) => value.trim().toLowerCase().replace(/\s+/g, '-')
+      const idByKey = new Map<string, number>()
+      for (const agent of agents) {
+        idByKey.set(agent.name.trim().toLowerCase(), agent.id)
+        idByKey.set(normalize(agent.name), agent.id)
+      }
+
       for (const [agentName, info] of liveStatuses) {
-        updateStmt.run(
-          info.status,
-          Math.floor(info.lastActivity / 1000),
-          now,
-          workspaceId,
-          agentName,
-          agentName
-        )
+        const key = normalize(agentName)
+        const id = idByKey.get(key) ?? idByKey.get(agentName.trim().toLowerCase())
+        if (!id) continue
+
+        await prisma.agents.update({
+          where: { id },
+          data: {
+            status: info.status,
+            last_seen: Math.floor(info.lastActivity / 1000),
+            updated_at: now,
+          },
+          select: { id: true },
+        })
       }
     } catch (dbErr) {
       logger.error({ err: dbErr }, 'Error syncing agent statuses')
@@ -469,9 +477,9 @@ async function performHealthCheck() {
 
   // Check DB connectivity
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const start = Date.now()
-    db.prepare('SELECT 1').get()
+    await prisma.$queryRawUnsafe('SELECT 1')
     const elapsed = Date.now() - start
 
     let dbStatus: string
@@ -605,17 +613,12 @@ async function getCapabilities(request?: NextRequest) {
   // A DB row alone isn't enough — the gateway must actually be reachable.
   let gatewayReachable = false
   try {
-    const db = getDatabase()
-    const table = db.prepare(
-      "SELECT name FROM sqlite_master WHERE type='table' AND name='gateways'"
-    ).get() as { name?: string } | undefined
-    if (table?.name) {
-      const rows = db.prepare('SELECT host, port FROM gateways').all() as { host: string; port: number }[]
-      if (rows.length > 0) {
-        const probes = rows.map(r => isPortOpen(r.host, Number(r.port)))
-        const results = await Promise.all(probes)
-        gatewayReachable = results.some(Boolean)
-      }
+    const prisma = getPrismaClient()
+    const rows = await prisma.gateways.findMany({ select: { host: true, port: true } }) as any[]
+    if (rows.length > 0) {
+      const probes = rows.map(r => isPortOpen(String(r.host), Number(r.port)))
+      const results = await Promise.all(probes)
+      gatewayReachable = results.some(Boolean)
     }
   } catch {
     // ignore — fall through to default probe
@@ -633,11 +636,8 @@ async function getCapabilities(request?: NextRequest) {
 
   let claudeSessions = 0
   try {
-    const db = getDatabase()
-    const row = db.prepare(
-      "SELECT COUNT(*) as c FROM claude_sessions WHERE is_active = 1"
-    ).get() as { c: number } | undefined
-    claudeSessions = row?.c ?? 0
+    const prisma = getPrismaClient()
+    claudeSessions = await prisma.claude_sessions.count({ where: { is_active: 1 } })
   } catch {
     // claude_sessions table may not exist
   }
@@ -651,12 +651,18 @@ async function getCapabilities(request?: NextRequest) {
 
   // Apply subscription overrides from settings
   try {
-    const settingsDb = getDatabase()
-    const planOverride = settingsDb.prepare("SELECT value FROM settings WHERE key = 'subscription.plan_override'").get() as { value: string } | undefined
+    const prisma = getPrismaClient()
+    const planOverride = await prisma.settings.findUnique({
+      where: { key: 'subscription.plan_override' },
+      select: { value: true },
+    }) as any
     if (planOverride?.value && subscription) {
       subscription.type = planOverride.value
     }
-    const codexPlan = settingsDb.prepare("SELECT value FROM settings WHERE key = 'subscription.codex_plan'").get() as { value: string } | undefined
+    const codexPlan = await prisma.settings.findUnique({
+      where: { key: 'subscription.codex_plan' },
+      select: { value: true },
+    }) as any
     if (codexPlan?.value) {
       subscriptions['openai'] = { provider: 'openai', type: codexPlan.value, source: 'env' as const }
     }
@@ -669,8 +675,11 @@ async function getCapabilities(request?: NextRequest) {
   // Interface mode preference
   let interfaceMode = 'essential'
   try {
-    const settingsDb = getDatabase()
-    const modeRow = settingsDb.prepare("SELECT value FROM settings WHERE key = 'general.interface_mode'").get() as { value: string } | undefined
+    const prisma = getPrismaClient()
+    const modeRow = await prisma.settings.findUnique({
+      where: { key: 'general.interface_mode' },
+      select: { value: true },
+    }) as any
     if (modeRow?.value === 'full' || modeRow?.value === 'essential') {
       interfaceMode = modeRow.value
     }

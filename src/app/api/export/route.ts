@@ -1,14 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
-import { getDatabase, logAuditEvent } from '@/lib/db'
+import { logAuditEvent } from '@/lib/db'
 import { heavyLimiter } from '@/lib/rate-limit'
+import { getPrismaClient } from '@/lib/prisma'
 
 /**
  * GET /api/export?type=audit|tasks|activities|pipelines&format=csv|json&since=UNIX&until=UNIX
  * Admin-only data export endpoint.
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = heavyLimiter(request)
@@ -27,21 +28,18 @@ export async function GET(request: NextRequest) {
     )
   }
 
-  const db = getDatabase()
+  const prisma = getPrismaClient()
   const workspaceId = auth.user.workspace_id ?? 1
-  const conditions: string[] = []
-  const params: any[] = []
+  const createdAtWhere: any = {}
 
   if (since) {
-    conditions.push('created_at >= ?')
-    params.push(parseInt(since))
+    const sinceNum = parseInt(since)
+    if (Number.isFinite(sinceNum)) createdAtWhere.gte = sinceNum
   }
   if (until) {
-    conditions.push('created_at <= ?')
-    params.push(parseInt(until))
+    const untilNum = parseInt(until)
+    if (Number.isFinite(untilNum)) createdAtWhere.lte = untilNum
   }
-
-  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
 
   const requestedLimit = parseInt(searchParams.get('limit') || '10000')
   const maxLimit = 50000
@@ -54,34 +52,52 @@ export async function GET(request: NextRequest) {
   switch (type) {
     case 'audit': {
       // audit_log is instance-global (no workspace_id column); export is admin-only so this is safe
-      rows = db.prepare(`SELECT * FROM audit_log ${where} ORDER BY created_at DESC LIMIT ?`).all(...params, limit)
+      rows = await prisma.audit_log.findMany({
+        where: Object.keys(createdAtWhere).length ? { created_at: createdAtWhere } : undefined,
+        orderBy: { created_at: 'desc' },
+        take: limit,
+      })
       headers = ['id', 'action', 'actor', 'actor_id', 'target_type', 'target_id', 'detail', 'ip_address', 'user_agent', 'created_at']
       filename = 'audit-log'
       break
     }
     case 'tasks': {
-      conditions.unshift('workspace_id = ?')
-      params.unshift(workspaceId)
-      const scopedWhere = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
-      rows = db.prepare(`SELECT * FROM tasks ${scopedWhere} ORDER BY created_at DESC LIMIT ?`).all(...params, limit)
+      const where: any = { workspace_id: workspaceId }
+      if (Object.keys(createdAtWhere).length) where.created_at = createdAtWhere
+      rows = await prisma.tasks.findMany({
+        where,
+        orderBy: { created_at: 'desc' },
+        take: limit,
+      })
       headers = ['id', 'title', 'description', 'status', 'priority', 'assigned_to', 'created_by', 'created_at', 'updated_at', 'due_date', 'estimated_hours', 'actual_hours', 'tags']
       filename = 'tasks'
       break
     }
     case 'activities': {
-      conditions.unshift('workspace_id = ?')
-      params.unshift(workspaceId)
-      const scopedWhere = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
-      rows = db.prepare(`SELECT * FROM activities ${scopedWhere} ORDER BY created_at DESC LIMIT ?`).all(...params, limit)
+      const where: any = { workspace_id: workspaceId }
+      if (Object.keys(createdAtWhere).length) where.created_at = createdAtWhere
+      rows = await prisma.activities.findMany({
+        where,
+        orderBy: { created_at: 'desc' },
+        take: limit,
+      })
       headers = ['id', 'type', 'entity_type', 'entity_id', 'actor', 'description', 'data', 'created_at']
       filename = 'activities'
       break
     }
     case 'pipelines': {
-      conditions.unshift('pr.workspace_id = ?')
-      params.unshift(workspaceId)
-      const scopedWhere = conditions.length > 0 ? `WHERE ${conditions.map(c => c.replace(/^created_at/, 'pr.created_at')).join(' AND ')}` : ''
-      rows = db.prepare(`SELECT pr.*, wp.name as pipeline_name FROM pipeline_runs pr LEFT JOIN workflow_pipelines wp ON pr.pipeline_id = wp.id ${scopedWhere} ORDER BY pr.created_at DESC LIMIT ?`).all(...params, limit)
+      const where: any = { workspace_id: workspaceId }
+      if (Object.keys(createdAtWhere).length) where.created_at = createdAtWhere
+      const pipelineRuns = await prisma.pipeline_runs.findMany({
+        where,
+        orderBy: { created_at: 'desc' },
+        take: limit,
+        include: { workflow_pipelines: { select: { name: true } } },
+      })
+      rows = (pipelineRuns as any[]).map((run) => ({
+        ...run,
+        pipeline_name: run.workflow_pipelines?.name ?? null,
+      }))
       headers = ['id', 'pipeline_id', 'pipeline_name', 'status', 'current_step', 'steps_snapshot', 'started_at', 'completed_at', 'triggered_by', 'created_at']
       filename = 'pipeline-runs'
       break

@@ -345,7 +345,7 @@ function readHermesTranscript(sessionId: string, limit: number): TranscriptMessa
  *   limit=40
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {

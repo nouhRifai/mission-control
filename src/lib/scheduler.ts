@@ -1,4 +1,5 @@
-import { getDatabase, logAuditEvent } from './db'
+import Database from 'better-sqlite3'
+import { logAuditEvent } from './db'
 import { syncAgentsFromConfig } from './agent-sync'
 import { config, ensureDirExists } from './config'
 import { join, dirname } from 'path'
@@ -11,6 +12,9 @@ import { syncSkillsFromDisk } from './skill-sync'
 import { syncLocalAgents } from './local-agent-sync'
 import { dispatchAssignedTasks, runAegisReviews } from './task-dispatch'
 import { spawnRecurringTasks } from './recurring-tasks'
+import { getPrismaClient, isPostgresProvider } from './prisma'
+import { createPostgresBackup } from './database-ops'
+import { getDatabaseBackupExtension } from './database-provider'
 
 const BACKUP_DIR = join(dirname(config.dbPath), 'backups')
 
@@ -27,39 +31,74 @@ interface ScheduledTask {
 const tasks: Map<string, ScheduledTask> = new Map()
 let tickInterval: ReturnType<typeof setInterval> | null = null
 
-/** Check if a setting is enabled (reads from settings table, falls back to default) */
-function isSettingEnabled(key: string, defaultValue: boolean): boolean {
+const SCHEDULER_SETTING_KEYS = [
+  'general.auto_backup',
+  'general.backup_retention_count',
+  'general.auto_cleanup',
+  'general.agent_timeout_minutes',
+  'webhooks.retry_enabled',
+  'general.claude_session_scan',
+  'general.skill_sync',
+  'general.local_agent_sync',
+  'general.gateway_agent_sync',
+  'general.task_dispatch',
+  'general.aegis_review',
+  'general.recurring_task_spawn',
+  'general.agent_heartbeat',
+] as const
+
+let settingsCache = new Map<string, string>()
+let lastSettingsRefreshMs = 0
+
+async function refreshSettingsCache(force = false) {
+  const now = Date.now()
+  if (!force && now - lastSettingsRefreshMs < 30_000) return
+  lastSettingsRefreshMs = now
+
   try {
-    const db = getDatabase()
-    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | undefined
-    if (row) return row.value === 'true'
-    return defaultValue
+    const prisma = getPrismaClient()
+    const rows = await prisma.settings.findMany({
+      where: { key: { in: [...SCHEDULER_SETTING_KEYS] as any } },
+      select: { key: true, value: true },
+    })
+    settingsCache = new Map(rows.map((row: any) => [row.key, row.value]))
   } catch {
-    return defaultValue
+    // Best-effort: keep last known values.
   }
 }
 
+/** Check if a setting is enabled (reads from settings cache, falls back to default). */
+function isSettingEnabled(key: string, defaultValue: boolean): boolean {
+  const raw = settingsCache.get(key)
+  if (raw == null) return defaultValue
+  return raw === 'true' || raw === '1'
+}
+
 function getSettingNumber(key: string, defaultValue: number): number {
-  try {
-    const db = getDatabase()
-    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | undefined
-    if (row) return parseInt(row.value) || defaultValue
-    return defaultValue
-  } catch {
-    return defaultValue
-  }
+  const raw = settingsCache.get(key)
+  if (raw == null) return defaultValue
+  const parsed = parseInt(raw, 10)
+  return Number.isFinite(parsed) ? parsed : defaultValue
 }
 
 /** Run a database backup */
 async function runBackup(): Promise<{ ok: boolean; message: string }> {
+  await refreshSettingsCache()
   ensureDirExists(BACKUP_DIR)
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19)
-  const backupPath = join(BACKUP_DIR, `mc-backup-${timestamp}.db`)
+  const backupPath = join(BACKUP_DIR, `mc-backup-${timestamp}${getDatabaseBackupExtension()}`)
 
   try {
-    const db = getDatabase()
-    await db.backup(backupPath)
+    if (isPostgresProvider()) {
+      await createPostgresBackup(backupPath)
+    } else {
+      const sqlite = new Database(config.dbPath)
+      sqlite.pragma('journal_mode = WAL')
+      sqlite.pragma('busy_timeout = 5000')
+      await sqlite.backup(backupPath)
+      sqlite.close()
+    }
 
     const stat = statSync(backupPath)
     logAuditEvent({
@@ -72,7 +111,7 @@ async function runBackup(): Promise<{ ok: boolean; message: string }> {
     const maxBackups = getSettingNumber('general.backup_retention_count', 10)
     try {
       const files = readdirSync(BACKUP_DIR)
-        .filter(f => f.startsWith('mc-backup-') && f.endsWith('.db'))
+        .filter(f => f.startsWith('mc-backup-') && f.endsWith(getDatabaseBackupExtension()))
         .map(f => ({ name: f, mtime: statSync(join(BACKUP_DIR, f)).mtimeMs }))
         .sort((a, b) => b.mtime - a.mtime)
 
@@ -93,7 +132,8 @@ async function runBackup(): Promise<{ ok: boolean; message: string }> {
 /** Run data cleanup based on retention settings */
 async function runCleanup(): Promise<{ ok: boolean; message: string }> {
   try {
-    const db = getDatabase()
+    await refreshSettingsCache()
+    const prisma = getPrismaClient()
     const now = Math.floor(Date.now() / 1000)
     const ret = config.retention
     let totalDeleted = 0
@@ -109,8 +149,19 @@ async function runCleanup(): Promise<{ ok: boolean; message: string }> {
       if (days <= 0) continue
       const cutoff = now - days * 86400
       try {
-        const res = db.prepare(`DELETE FROM ${table} WHERE ${column} < ?`).run(cutoff)
-        totalDeleted += res.changes
+        if (table === 'activities') {
+          const res = await prisma.activities.deleteMany({ where: { created_at: { lt: cutoff } } })
+          totalDeleted += res.count
+        } else if (table === 'audit_log') {
+          const res = await prisma.audit_log.deleteMany({ where: { created_at: { lt: cutoff } } })
+          totalDeleted += res.count
+        } else if (table === 'notifications') {
+          const res = await prisma.notifications.deleteMany({ where: { created_at: { lt: cutoff } } })
+          totalDeleted += res.count
+        } else if (table === 'pipeline_runs') {
+          const res = await prisma.pipeline_runs.deleteMany({ where: { created_at: { lt: cutoff } } })
+          totalDeleted += res.count
+        }
       } catch {
         // Table might not exist
       }
@@ -157,48 +208,61 @@ async function runCleanup(): Promise<{ ok: boolean; message: string }> {
 /** Check agent liveness - mark agents offline if not seen recently */
 async function runHeartbeatCheck(): Promise<{ ok: boolean; message: string }> {
   try {
-    const db = getDatabase()
+    await refreshSettingsCache()
+    const prisma = getPrismaClient()
     const now = Math.floor(Date.now() / 1000)
     const timeoutMinutes = getSettingNumber('general.agent_timeout_minutes', 10)
     const threshold = now - timeoutMinutes * 60
 
     // Find agents that are not offline but haven't been seen recently
-    const staleAgents = db.prepare(`
-      SELECT id, name, status, last_seen FROM agents
-      WHERE status != 'offline' AND (last_seen IS NULL OR last_seen < ?)
-    `).all(threshold) as Array<{ id: number; name: string; status: string; last_seen: number | null }>
+    const staleAgents = await prisma.agents.findMany({
+      where: {
+        status: { not: 'offline' },
+        OR: [{ last_seen: null }, { last_seen: { lt: threshold } }],
+      },
+      select: { id: true, name: true, status: true, last_seen: true },
+    }) as Array<{ id: number; name: string; status: string; last_seen: number | null }>
 
     if (staleAgents.length === 0) {
       return { ok: true, message: 'All agents healthy' }
     }
 
-    // Mark stale agents as offline
-    const markOffline = db.prepare('UPDATE agents SET status = ?, updated_at = ? WHERE id = ?')
-    const logActivity = db.prepare(`
-      INSERT INTO activities (type, entity_type, entity_id, actor, description)
-      VALUES ('agent_status_change', 'agent', ?, 'heartbeat', ?)
-    `)
-
     const names: string[] = []
-    db.transaction(() => {
+    await prisma.$transaction(async (tx) => {
       for (const agent of staleAgents) {
-        markOffline.run('offline', now, agent.id)
-        logActivity.run(agent.id, `Agent "${agent.name}" marked offline (no heartbeat for ${timeoutMinutes}m)`)
+        await tx.agents.update({
+          where: { id: agent.id },
+          data: { status: 'offline', updated_at: now },
+          select: { id: true },
+        })
+        await tx.activities.create({
+          data: {
+            type: 'agent_status_change',
+            entity_type: 'agent',
+            entity_id: agent.id,
+            actor: 'heartbeat',
+            description: `Agent "${agent.name}" marked offline (no heartbeat for ${timeoutMinutes}m)`,
+            created_at: now,
+            workspace_id: 1,
+          },
+          select: { id: true },
+        })
+        await tx.notifications.create({
+          data: {
+            recipient: 'system',
+            type: 'heartbeat',
+            title: `Agent offline: ${agent.name}`,
+            message: `Agent "${agent.name}" was marked offline after ${timeoutMinutes} minutes without heartbeat`,
+            source_type: 'agent',
+            source_id: agent.id,
+            created_at: now,
+            workspace_id: 1,
+          },
+          select: { id: true },
+        })
         names.push(agent.name)
-
-        // Create notification for each stale agent
-        try {
-          db.prepare(`
-            INSERT INTO notifications (recipient, type, title, message, source_type, source_id)
-            VALUES ('system', 'heartbeat', ?, ?, 'agent', ?)
-          `).run(
-            `Agent offline: ${agent.name}`,
-            `Agent "${agent.name}" was marked offline after ${timeoutMinutes} minutes without heartbeat`,
-            agent.id
-          )
-        } catch { /* notification creation failed */ }
       }
-    })()
+    })
 
     logAuditEvent({
       action: 'heartbeat_check',
@@ -219,6 +283,8 @@ const TICK_MS = 60 * 1000 // Check every minute
 /** Initialize the scheduler */
 export function initScheduler() {
   if (tickInterval) return // Already running
+
+  void refreshSettingsCache(true)
 
   // Auto-sync agents from openclaw.json on startup
   syncAgentsFromConfig('startup').catch(err => {
@@ -348,6 +414,7 @@ function getNextDailyMs(hour: number): number {
 
 /** Check and run due tasks */
 async function tick() {
+  await refreshSettingsCache()
   const now = Date.now()
 
   for (const [id, task] of tasks) {

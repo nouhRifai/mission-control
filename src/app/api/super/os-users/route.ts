@@ -4,8 +4,9 @@ import fs from 'fs'
 import os from 'os'
 import path from 'path'
 import { requireRole, getUserFromRequest } from '@/lib/auth'
-import { getDatabase, logAuditEvent } from '@/lib/db'
+import { logAuditEvent } from '@/lib/db'
 import { logger } from '@/lib/logger'
+import { getPrismaClient } from '@/lib/prisma'
 
 export interface OsUser {
   username: string
@@ -217,7 +218,7 @@ function discoverOsUsers(): OsUser[] {
  * Users already linked to a tenant have linked_tenant_id set.
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const users = discoverOsUsers()
@@ -232,8 +233,10 @@ export async function GET(request: NextRequest) {
 
   // Cross-reference with existing tenants to mark linked ones
   try {
-    const { listTenants } = await import('@/lib/super-admin')
-    const tenants = listTenants()
+    const prisma = getPrismaClient()
+    const tenants = await prisma.tenants.findMany({
+      select: { linux_user: true, id: true },
+    })
     const tenantByLinuxUser = new Map(tenants.map(t => [t.linux_user, t.id]))
     for (const user of users) {
       user.linked_tenant_id = tenantByLinuxUser.get(user.username) ?? null
@@ -252,10 +255,10 @@ export async function GET(request: NextRequest) {
  * Body: { username, display_name, password?, gateway_mode?: boolean, gateway_port?, owner_gateway? }
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
-  const currentUser = getUserFromRequest(request)
+  const currentUser = await getUserFromRequest(request)
   const actor = currentUser?.username || 'system'
 
   let body: any
@@ -287,8 +290,11 @@ export async function POST(request: NextRequest) {
   const alreadyExists = existingUsers.some(u => u.username === username)
 
   // Check if already registered as tenant
-  const db = getDatabase()
-  const existingTenant = db.prepare('SELECT id FROM tenants WHERE linux_user = ? OR slug = ?').get(username, username) as any
+  const prisma = getPrismaClient()
+  const existingTenant = await prisma.tenants.findFirst({
+    where: { OR: [{ linux_user: username }, { slug: username }] },
+    select: { id: true },
+  })
   if (existingTenant) {
     return NextResponse.json({ error: 'This user is already registered as an organization' }, { status: 409 })
   }
@@ -377,12 +383,26 @@ export async function POST(request: NextRequest) {
     const workspaceRoot = path.posix.join(homeDir, 'workspace')
 
     // Register as tenant in DB
-    const tenantRes = db.prepare(`
-      INSERT INTO tenants (slug, display_name, linux_user, plan_tier, status, openclaw_home, workspace_root, gateway_port, dashboard_port, config, created_by, owner_gateway)
-      VALUES (?, ?, ?, 'local', 'active', ?, ?, NULL, NULL, '{}', ?, 'local')
-    `).run(username, displayName, username, openclawHome, workspaceRoot, actor)
-
-    const tenantId = Number(tenantRes.lastInsertRowid)
+    const now = Math.floor(Date.now() / 1000)
+    const tenantRes = await prisma.tenants.create({
+      data: {
+        slug: username,
+        display_name: displayName,
+        linux_user: username,
+        plan_tier: 'local',
+        status: 'active',
+        openclaw_home: openclawHome,
+        workspace_root: workspaceRoot,
+        gateway_port: null,
+        dashboard_port: null,
+        config: '{}',
+        created_by: actor,
+        owner_gateway: 'local',
+        created_at: now,
+        updated_at: now,
+      },
+    })
+    const tenantId = tenantRes.id
 
     logAuditEvent({
       action: 'tenant_local_created',
@@ -392,7 +412,7 @@ export async function POST(request: NextRequest) {
       detail: { username, display_name: displayName, os_user_existed: alreadyExists, platform },
     })
 
-    const tenant = db.prepare('SELECT * FROM tenants WHERE id = ?').get(tenantId)
+    const tenant = tenantRes
 
     // Install requested tools (non-fatal)
     const installResults: Record<string, { success: boolean; error?: string }> = {}

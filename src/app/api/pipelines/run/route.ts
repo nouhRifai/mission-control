@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getDatabase, db_helpers } from '@/lib/db'
+import { db_helpers } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { eventBus } from '@/lib/event-bus'
 import { logger } from '@/lib/logger'
+import { getPrismaClient } from '@/lib/prisma'
 
 interface PipelineStep {
   template_id: number
@@ -36,11 +37,11 @@ interface PipelineRun {
  * GET /api/pipelines/run - Get pipeline runs
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const { searchParams } = new URL(request.url)
     const workspaceId = auth.user.workspace_id ?? 1
     const pipelineId = searchParams.get('pipeline_id')
@@ -48,30 +49,27 @@ export async function GET(request: NextRequest) {
     const limit = Math.min(parseInt(searchParams.get('limit') || '20'), 200)
 
     if (runId) {
-      const run = db
-        .prepare('SELECT * FROM pipeline_runs WHERE id = ? AND workspace_id = ?')
-        .get(parseInt(runId), workspaceId) as PipelineRun | undefined
+      const run = (await prisma.pipeline_runs.findFirst({
+        where: { id: parseInt(runId), workspace_id: workspaceId },
+      })) as unknown as PipelineRun | null
       if (!run) return NextResponse.json({ error: 'Run not found' }, { status: 404 })
       return NextResponse.json({ run: { ...run, steps_snapshot: JSON.parse(run.steps_snapshot) } })
     }
 
-    let query = 'SELECT * FROM pipeline_runs WHERE workspace_id = ?'
-    const params: any[] = [workspaceId]
-
-    if (pipelineId) {
-      query += ' AND pipeline_id = ?'
-      params.push(parseInt(pipelineId))
-    }
-
-    query += ' ORDER BY created_at DESC LIMIT ?'
-    params.push(limit)
-
-    const runs = db.prepare(query).all(...params) as PipelineRun[]
+    const pipelineIdInt = pipelineId ? parseInt(pipelineId) : null
+    const runs = (await prisma.pipeline_runs.findMany({
+      where: { workspace_id: workspaceId, ...(pipelineIdInt ? { pipeline_id: pipelineIdInt } : {}) } as any,
+      orderBy: { created_at: 'desc' },
+      take: limit,
+    })) as unknown as PipelineRun[]
 
     // Enrich with pipeline names
     const pipelineIds = [...new Set(runs.map(r => r.pipeline_id))]
     const pipelines = pipelineIds.length > 0
-      ? db.prepare(`SELECT id, name FROM workflow_pipelines WHERE workspace_id = ? AND id IN (${pipelineIds.map(() => '?').join(',')})`).all(workspaceId, ...pipelineIds) as Array<{ id: number; name: string }>
+      ? await prisma.workflow_pipelines.findMany({
+          where: { workspace_id: workspaceId, id: { in: pipelineIds } },
+          select: { id: true, name: true },
+        })
       : []
     const nameMap = new Map(pipelines.map(p => [p.id, p.name]))
 
@@ -92,21 +90,21 @@ export async function GET(request: NextRequest) {
  * POST /api/pipelines/run - Start a pipeline run or advance a running one
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const workspaceId = auth.user.workspace_id ?? 1
     const body = await request.json()
     const { action, pipeline_id, run_id } = body
 
     if (action === 'start') {
-      return startPipeline(db, pipeline_id, auth.user?.username || 'system', workspaceId)
+      return startPipeline(prisma, pipeline_id, auth.user?.username || 'system', workspaceId)
     } else if (action === 'advance') {
-      return advanceRun(db, run_id, body.success ?? true, body.error, workspaceId)
+      return advanceRun(prisma, run_id, body.success ?? true, body.error, workspaceId)
     } else if (action === 'cancel') {
-      return cancelRun(db, run_id, workspaceId)
+      return cancelRun(prisma, run_id, workspaceId)
     }
 
     return NextResponse.json({ error: 'Invalid action. Use: start, advance, cancel' }, { status: 400 })
@@ -118,7 +116,7 @@ export async function POST(request: NextRequest) {
 
 /** Spawn a single pipeline step using `openclaw agent` */
 async function spawnStep(
-  db: ReturnType<typeof getDatabase>,
+  prisma: ReturnType<typeof getPrismaClient>,
   pipelineName: string,
   template: { name: string; model: string; task_prompt: string; timeout_seconds: number },
   steps: RunStepState[],
@@ -138,20 +136,28 @@ async function spawnStep(
 
     const spawnId = `pipeline-${runId}-step-${stepIdx}-${Date.now()}`
     steps[stepIdx].spawn_id = spawnId
-    db.prepare('UPDATE pipeline_runs SET steps_snapshot = ? WHERE id = ? AND workspace_id = ?').run(JSON.stringify(steps), runId, workspaceId)
+    await prisma.pipeline_runs.updateMany({
+      where: { id: runId, workspace_id: workspaceId },
+      data: { steps_snapshot: JSON.stringify(steps) },
+    })
 
     return { success: true, stdout: stdout.trim() }
   } catch (err: any) {
     // Spawn failed - record error but keep pipeline running for manual advance
     steps[stepIdx].error = err.message
-    db.prepare('UPDATE pipeline_runs SET steps_snapshot = ? WHERE id = ? AND workspace_id = ?').run(JSON.stringify(steps), runId, workspaceId)
+    await prisma.pipeline_runs.updateMany({
+      where: { id: runId, workspace_id: workspaceId },
+      data: { steps_snapshot: JSON.stringify(steps) },
+    })
 
     return { success: false, error: err.message }
   }
 }
 
-async function startPipeline(db: ReturnType<typeof getDatabase>, pipelineId: number, triggeredBy: string, workspaceId: number) {
-  const pipeline = db.prepare('SELECT * FROM workflow_pipelines WHERE id = ? AND workspace_id = ?').get(pipelineId, workspaceId) as any
+async function startPipeline(prisma: ReturnType<typeof getPrismaClient>, pipelineId: number, triggeredBy: string, workspaceId: number) {
+  const pipeline = await prisma.workflow_pipelines.findFirst({
+    where: { id: pipelineId, workspace_id: workspaceId },
+  }) as any
   if (!pipeline) return NextResponse.json({ error: 'Pipeline not found' }, { status: 404 })
 
   const steps: PipelineStep[] = JSON.parse(pipeline.steps || '[]')
@@ -159,9 +165,10 @@ async function startPipeline(db: ReturnType<typeof getDatabase>, pipelineId: num
 
   // Get template names for snapshot
   const templateIds = steps.map(s => s.template_id)
-  const templates = db.prepare(
-    `SELECT id, name, model, task_prompt, timeout_seconds FROM workflow_templates WHERE id IN (${templateIds.map(() => '?').join(',')})`
-  ).all(...templateIds) as Array<{ id: number; name: string; model: string; task_prompt: string; timeout_seconds: number }>
+  const templates = await prisma.workflow_templates.findMany({
+    where: { workspace_id: workspaceId, id: { in: templateIds } },
+    select: { id: true, name: true, model: true, task_prompt: true, timeout_seconds: true },
+  }) as Array<{ id: number; name: string; model: string; task_prompt: string; timeout_seconds: number }>
   const templateMap = new Map(templates.map(t => [t.id, t]))
 
   // Build step snapshot
@@ -178,23 +185,33 @@ async function startPipeline(db: ReturnType<typeof getDatabase>, pipelineId: num
   }))
 
   const now = Math.floor(Date.now() / 1000)
-  const result = db.prepare(`
-    INSERT INTO pipeline_runs (pipeline_id, status, current_step, steps_snapshot, started_at, triggered_by, workspace_id)
-    VALUES (?, 'running', 0, ?, ?, ?, ?)
-  `).run(pipelineId, JSON.stringify(stepsSnapshot), now, triggeredBy, workspaceId)
+  const created = await prisma.pipeline_runs.create({
+    data: {
+      pipeline_id: pipelineId,
+      status: 'running',
+      current_step: 0,
+      steps_snapshot: JSON.stringify(stepsSnapshot),
+      started_at: now,
+      triggered_by: triggeredBy,
+      workspace_id: workspaceId,
+      created_at: now,
+    } as any,
+    select: { id: true },
+  })
 
-  const runId = Number(result.lastInsertRowid)
+  const runId = created.id
 
   // Update pipeline usage
-  db.prepare(`
-    UPDATE workflow_pipelines SET use_count = use_count + 1, last_used_at = ?, updated_at = ? WHERE id = ? AND workspace_id = ?
-  `).run(now, now, pipelineId, workspaceId)
+  await prisma.workflow_pipelines.updateMany({
+    where: { id: pipelineId, workspace_id: workspaceId },
+    data: { use_count: { increment: 1 }, last_used_at: now, updated_at: now } as any,
+  })
 
   // Spawn first step
   const firstTemplate = templateMap.get(steps[0].template_id)
   let spawnResult: any = null
   if (firstTemplate) {
-    spawnResult = await spawnStep(db, pipeline.name, firstTemplate, stepsSnapshot, 0, runId, workspaceId)
+    spawnResult = await spawnStep(prisma, pipeline.name, firstTemplate, stepsSnapshot, 0, runId, workspaceId)
   }
 
   db_helpers.logActivity('pipeline_started', 'pipeline', pipelineId, triggeredBy, `Started pipeline: ${pipeline.name}`, { run_id: runId }, workspaceId)
@@ -219,10 +236,12 @@ async function startPipeline(db: ReturnType<typeof getDatabase>, pipelineId: num
   }, { status: 201 })
 }
 
-async function advanceRun(db: ReturnType<typeof getDatabase>, runId: number, success: boolean, errorMsg: string | undefined, workspaceId: number) {
+async function advanceRun(prisma: ReturnType<typeof getPrismaClient>, runId: number, success: boolean, errorMsg: string | undefined, workspaceId: number) {
   if (!runId) return NextResponse.json({ error: 'run_id required' }, { status: 400 })
 
-  const run = db.prepare('SELECT * FROM pipeline_runs WHERE id = ? AND workspace_id = ?').get(runId, workspaceId) as PipelineRun | undefined
+  const run = (await prisma.pipeline_runs.findFirst({
+    where: { id: runId, workspace_id: workspaceId },
+  })) as unknown as PipelineRun | null
   if (!run) return NextResponse.json({ error: 'Run not found' }, { status: 404 })
   if (run.status !== 'running') return NextResponse.json({ error: `Run is ${run.status}, not running` }, { status: 400 })
 
@@ -242,16 +261,20 @@ async function advanceRun(db: ReturnType<typeof getDatabase>, runId: number, suc
   if (!success && onFailure === 'stop') {
     // Mark remaining steps as skipped
     for (let i = nextIdx; i < steps.length; i++) steps[i].status = 'skipped'
-    db.prepare('UPDATE pipeline_runs SET status = ?, current_step = ?, steps_snapshot = ?, completed_at = ? WHERE id = ? AND workspace_id = ?')
-      .run('failed', currentIdx, JSON.stringify(steps), now, runId, workspaceId)
+    await prisma.pipeline_runs.updateMany({
+      where: { id: runId, workspace_id: workspaceId },
+      data: { status: 'failed', current_step: currentIdx, steps_snapshot: JSON.stringify(steps), completed_at: now },
+    })
     return NextResponse.json({ run: { id: runId, status: 'failed', steps_snapshot: steps } })
   }
 
   if (nextIdx >= steps.length) {
     // Pipeline complete
     const finalStatus = steps.some(s => s.status === 'failed') ? 'completed' : 'completed'
-    db.prepare('UPDATE pipeline_runs SET status = ?, current_step = ?, steps_snapshot = ?, completed_at = ? WHERE id = ? AND workspace_id = ?')
-      .run(finalStatus, currentIdx, JSON.stringify(steps), now, runId, workspaceId)
+    await prisma.pipeline_runs.updateMany({
+      where: { id: runId, workspace_id: workspaceId },
+      data: { status: finalStatus, current_step: currentIdx, steps_snapshot: JSON.stringify(steps), completed_at: now },
+    })
 
     eventBus.broadcast('activity.created', {
       type: 'pipeline_completed',
@@ -267,27 +290,36 @@ async function advanceRun(db: ReturnType<typeof getDatabase>, runId: number, suc
   steps[nextIdx].status = 'running'
   steps[nextIdx].started_at = now
 
-  const template = db.prepare('SELECT id, name, model, task_prompt, timeout_seconds FROM workflow_templates WHERE id = ?')
-    .get(steps[nextIdx].template_id) as any
+  const template = await prisma.workflow_templates.findFirst({
+    where: { id: steps[nextIdx].template_id, workspace_id: workspaceId },
+    select: { id: true, name: true, model: true, task_prompt: true, timeout_seconds: true },
+  }) as any
 
   let spawnResult: any = null
   if (template) {
-    const pipeline = db.prepare('SELECT name FROM workflow_pipelines WHERE id = ? AND workspace_id = ?').get(run.pipeline_id, workspaceId) as any
-    spawnResult = await spawnStep(db, pipeline?.name || '?', template, steps, nextIdx, runId, workspaceId)
+    const pipeline = await prisma.workflow_pipelines.findFirst({
+      where: { id: run.pipeline_id, workspace_id: workspaceId },
+      select: { name: true },
+    }) as any
+    spawnResult = await spawnStep(prisma, pipeline?.name || '?', template, steps, nextIdx, runId, workspaceId)
   }
 
-  db.prepare('UPDATE pipeline_runs SET current_step = ?, steps_snapshot = ? WHERE id = ? AND workspace_id = ?')
-    .run(nextIdx, JSON.stringify(steps), runId, workspaceId)
+  await prisma.pipeline_runs.updateMany({
+    where: { id: runId, workspace_id: workspaceId },
+    data: { current_step: nextIdx, steps_snapshot: JSON.stringify(steps) },
+  })
 
   return NextResponse.json({
     run: { id: runId, status: 'running', current_step: nextIdx, steps_snapshot: steps, spawn: spawnResult }
   })
 }
 
-function cancelRun(db: ReturnType<typeof getDatabase>, runId: number, workspaceId: number) {
+async function cancelRun(prisma: ReturnType<typeof getPrismaClient>, runId: number, workspaceId: number) {
   if (!runId) return NextResponse.json({ error: 'run_id required' }, { status: 400 })
 
-  const run = db.prepare('SELECT * FROM pipeline_runs WHERE id = ? AND workspace_id = ?').get(runId, workspaceId) as PipelineRun | undefined
+  const run = (await prisma.pipeline_runs.findFirst({
+    where: { id: runId, workspace_id: workspaceId },
+  })) as unknown as PipelineRun | null
   if (!run) return NextResponse.json({ error: 'Run not found' }, { status: 404 })
   if (run.status !== 'running' && run.status !== 'pending') {
     return NextResponse.json({ error: `Run is ${run.status}, cannot cancel` }, { status: 400 })
@@ -303,8 +335,10 @@ function cancelRun(db: ReturnType<typeof getDatabase>, runId: number, workspaceI
     }
   }
 
-  db.prepare('UPDATE pipeline_runs SET status = ?, steps_snapshot = ?, completed_at = ? WHERE id = ? AND workspace_id = ?')
-    .run('cancelled', JSON.stringify(steps), now, runId, workspaceId)
+  await prisma.pipeline_runs.updateMany({
+    where: { id: runId, workspace_id: workspaceId },
+    data: { status: 'cancelled', steps_snapshot: JSON.stringify(steps), completed_at: now },
+  })
 
   return NextResponse.json({ run: { id: runId, status: 'cancelled', steps_snapshot: steps } })
 }

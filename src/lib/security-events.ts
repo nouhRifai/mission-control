@@ -5,9 +5,9 @@
  * Trust scores are recalculated on each security event using weighted factors.
  */
 
-import { getDatabase } from '@/lib/db'
 import { eventBus, type EventType } from '@/lib/event-bus'
 import { logger } from '@/lib/logger'
+import { getPrismaClient } from '@/lib/prisma'
 
 export type SecuritySeverity = 'info' | 'warning' | 'critical'
 
@@ -40,66 +40,71 @@ const TRUST_WEIGHTS: Record<string, { field: string; delta: number }> = {
   'task.failure': { field: 'failed_tasks', delta: -0.01 },
 }
 
-export function logSecurityEvent(event: SecurityEvent): number {
-  const db = getDatabase()
+export async function logSecurityEvent(event: SecurityEvent): Promise<number> {
+  const prisma = getPrismaClient()
   const severity = event.severity ?? 'info'
   const workspaceId = event.workspace_id ?? 1
   const tenantId = event.tenant_id ?? 1
+  const now = Math.floor(Date.now() / 1000)
 
-  const result = db.prepare(`
-    INSERT INTO security_events (event_type, severity, source, agent_name, detail, ip_address, workspace_id, tenant_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    event.event_type,
-    severity,
-    event.source ?? null,
-    event.agent_name ?? null,
-    event.detail ?? null,
-    event.ip_address ?? null,
-    workspaceId,
-    tenantId,
-  )
-
-  const id = result.lastInsertRowid as number
+  const created = await prisma.security_events.create({
+    data: {
+      event_type: event.event_type,
+      severity,
+      source: event.source ?? null,
+      agent_name: event.agent_name ?? null,
+      detail: event.detail ?? null,
+      ip_address: event.ip_address ?? null,
+      workspace_id: workspaceId,
+      tenant_id: tenantId,
+      created_at: now,
+    },
+    select: { id: true },
+  })
 
   eventBus.broadcast('security.event' as EventType, {
-    id,
+    id: created.id,
     ...event,
     severity,
     workspace_id: workspaceId,
-    timestamp: Math.floor(Date.now() / 1000),
+    timestamp: now,
   })
 
-  return id
+  return created.id
 }
 
-export function updateAgentTrustScore(
+export async function updateAgentTrustScore(
   agentName: string,
   eventType: string,
   workspaceId: number = 1,
-): void {
-  const db = getDatabase()
+): Promise<void> {
+  const prisma = getPrismaClient()
   const weight = TRUST_WEIGHTS[eventType]
+  const now = Math.floor(Date.now() / 1000)
 
   // Ensure row exists
-  db.prepare(`
-    INSERT OR IGNORE INTO agent_trust_scores (agent_name, workspace_id)
-    VALUES (?, ?)
-  `).run(agentName, workspaceId)
+  await prisma.agent_trust_scores.upsert({
+    where: { agent_name_workspace_id: { agent_name: agentName, workspace_id: workspaceId } },
+    create: { agent_name: agentName, workspace_id: workspaceId, updated_at: now },
+    update: {},
+    select: { id: true },
+  })
 
   if (weight) {
-    // Increment the counter field
-    db.prepare(`
-      UPDATE agent_trust_scores
-      SET ${weight.field} = ${weight.field} + 1,
-          updated_at = unixepoch()
-      WHERE agent_name = ? AND workspace_id = ?
-    `).run(agentName, workspaceId)
+    const counterField = weight.field as any
+    await prisma.agent_trust_scores.update({
+      where: { agent_name_workspace_id: { agent_name: agentName, workspace_id: workspaceId } },
+      data: {
+        [counterField]: { increment: 1 },
+        updated_at: now,
+      } as any,
+      select: { id: true },
+    })
 
     // Recalculate trust score (clamped 0..1)
-    const row = db.prepare(`
-      SELECT * FROM agent_trust_scores WHERE agent_name = ? AND workspace_id = ?
-    `).get(agentName, workspaceId) as any
+    const row = await prisma.agent_trust_scores.findUnique({
+      where: { agent_name_workspace_id: { agent_name: agentName, workspace_id: workspaceId } },
+    }) as any
 
     if (row) {
       let score = 1.0
@@ -112,60 +117,46 @@ export function updateAgentTrustScore(
       score = Math.max(0, Math.min(1, score))
 
       const isAnomaly = weight.delta < 0
-      db.prepare(`
-        UPDATE agent_trust_scores
-        SET trust_score = ?,
-            last_anomaly_at = CASE WHEN ? THEN unixepoch() ELSE last_anomaly_at END,
-            updated_at = unixepoch()
-        WHERE agent_name = ? AND workspace_id = ?
-      `).run(score, isAnomaly ? 1 : 0, agentName, workspaceId)
+      await prisma.agent_trust_scores.update({
+        where: { agent_name_workspace_id: { agent_name: agentName, workspace_id: workspaceId } },
+        data: {
+          trust_score: score,
+          last_anomaly_at: isAnomaly ? now : row.last_anomaly_at,
+          updated_at: now,
+        },
+        select: { id: true },
+      })
     }
   }
 }
 
-export function getSecurityPosture(workspaceId: number = 1): SecurityPosture {
-  const db = getDatabase()
+export async function getSecurityPosture(workspaceId: number = 1): Promise<SecurityPosture> {
+  const prisma = getPrismaClient()
   const oneDayAgo = Math.floor(Date.now() / 1000) - 86400
 
-  const totals = db.prepare(`
-    SELECT
-      COUNT(*) as total,
-      SUM(CASE WHEN severity = 'critical' THEN 1 ELSE 0 END) as critical,
-      SUM(CASE WHEN severity = 'warning' THEN 1 ELSE 0 END) as warning
-    FROM security_events
-    WHERE workspace_id = ?
-  `).get(workspaceId) as any
+  const [totalEvents, criticalEvents, warningEvents, recentIncidents, trustAgg] = await Promise.all([
+    prisma.security_events.count({ where: { workspace_id: workspaceId } }),
+    prisma.security_events.count({ where: { workspace_id: workspaceId, severity: 'critical' } }),
+    prisma.security_events.count({ where: { workspace_id: workspaceId, severity: 'warning' } }),
+    prisma.security_events.count({ where: { workspace_id: workspaceId, severity: { in: ['warning', 'critical'] }, created_at: { gt: oneDayAgo } } }),
+    prisma.agent_trust_scores.aggregate({ where: { workspace_id: workspaceId }, _avg: { trust_score: true } }),
+  ])
 
-  const recent = db.prepare(`
-    SELECT COUNT(*) as count
-    FROM security_events
-    WHERE workspace_id = ? AND severity IN ('warning', 'critical') AND created_at > ?
-  `).get(workspaceId, oneDayAgo) as any
-
-  const trustAvg = db.prepare(`
-    SELECT AVG(trust_score) as avg_trust
-    FROM agent_trust_scores
-    WHERE workspace_id = ?
-  `).get(workspaceId) as any
-
-  const avgTrust = trustAvg?.avg_trust ?? 1.0
-  const criticalCount = totals?.critical ?? 0
-  const warningCount = totals?.warning ?? 0
-  const recentCount = recent?.count ?? 0
+  const avgTrust = trustAgg._avg.trust_score ?? 1.0
 
   // Score: start at 100, deduct for incidents
   let score = 100
-  score -= criticalCount * 10
-  score -= warningCount * 3
-  score -= recentCount * 2
+  score -= criticalEvents * 10
+  score -= warningEvents * 3
+  score -= recentIncidents * 2
   score = Math.round(Math.max(0, Math.min(100, score * avgTrust)))
 
   return {
     score,
-    totalEvents: totals?.total ?? 0,
-    criticalEvents: criticalCount,
-    warningEvents: warningCount,
+    totalEvents,
+    criticalEvents,
+    warningEvents,
     avgTrustScore: Math.round(avgTrust * 100) / 100,
-    recentIncidents: recentCount,
+    recentIncidents,
   }
 }

@@ -1,14 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getDatabase, db_helpers } from '@/lib/db'
+import { db_helpers } from '@/lib/db'
 import { runOpenClaw } from '@/lib/command'
 import { requireRole } from '@/lib/auth'
 import { logger } from '@/lib/logger'
+import { getPrismaClient } from '@/lib/prisma'
 
 export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
@@ -26,24 +27,26 @@ export async function POST(
       return NextResponse.json({ error: 'Message is required' }, { status: 400 })
     }
 
-    const db = getDatabase()
-    const task = db
-      .prepare('SELECT * FROM tasks WHERE id = ? AND workspace_id = ?')
-      .get(taskId, workspaceId) as any
+    const prisma = getPrismaClient()
+    const task = await prisma.tasks.findFirst({
+      where: { id: taskId, workspace_id: workspaceId },
+      select: { id: true, title: true },
+    })
     if (!task) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 })
     }
 
-    const subscribers = new Set(db_helpers.getTaskSubscribers(taskId, workspaceId))
+    const subscribers = new Set(await db_helpers.getTaskSubscribers(taskId, workspaceId))
     subscribers.delete(author)
 
     if (subscribers.size === 0) {
       return NextResponse.json({ sent: 0, skipped: 0 })
     }
 
-    const agents = db
-      .prepare('SELECT name, session_key FROM agents WHERE workspace_id = ? AND name IN (' + Array.from(subscribers).map(() => '?').join(',') + ')')
-      .all(workspaceId, ...Array.from(subscribers)) as Array<{ name: string; session_key?: string }>
+    const agents = await prisma.agents.findMany({
+      where: { workspace_id: workspaceId, name: { in: Array.from(subscribers) } },
+      select: { name: true, session_key: true },
+    })
 
     const results = await Promise.allSettled(
       agents.map(async (agent) => {

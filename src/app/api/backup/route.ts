@@ -1,39 +1,30 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
-import { getDatabase, logAuditEvent } from '@/lib/db'
+import { logAuditEvent } from '@/lib/db'
 import { config, ensureDirExists } from '@/lib/config'
-import { join, dirname } from 'path'
+import { join } from 'path'
 import { readdirSync, statSync, unlinkSync } from 'fs'
 import { heavyLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
 import { runOpenClaw } from '@/lib/command'
+import { createPostgresBackup, getDatabaseBackupsRoot, listDatabaseBackups } from '@/lib/database-ops'
+import { getDatabaseBackupExtension } from '@/lib/database-provider'
+import { isPostgresProvider } from '@/lib/prisma'
 
-const BACKUP_DIR = join(dirname(config.dbPath), 'backups')
+const BACKUP_DIR = getDatabaseBackupsRoot()
 const MAX_BACKUPS = 10
 
 /**
  * GET /api/backup - List existing backups (admin only)
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   ensureDirExists(BACKUP_DIR)
 
   try {
-    const files = readdirSync(BACKUP_DIR)
-      .filter(f => f.endsWith('.db'))
-      .map(f => {
-        const stat = statSync(join(BACKUP_DIR, f))
-        return {
-          name: f,
-          size: stat.size,
-          created_at: Math.floor(stat.mtimeMs / 1000),
-        }
-      })
-      .sort((a, b) => b.created_at - a.created_at)
-
-    return NextResponse.json({ backups: files, dir: BACKUP_DIR })
+    return NextResponse.json({ backups: listDatabaseBackups(), dir: BACKUP_DIR })
   } catch {
     return NextResponse.json({ backups: [], dir: BACKUP_DIR })
   }
@@ -43,7 +34,7 @@ export async function GET(request: NextRequest) {
  * POST /api/backup - Create a new backup (admin only)
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = heavyLimiter(request)
@@ -95,13 +86,22 @@ export async function POST(request: NextRequest) {
   ensureDirExists(BACKUP_DIR)
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19)
-  const backupPath = join(BACKUP_DIR, `mc-backup-${timestamp}.db`)
+  const extension = getDatabaseBackupExtension()
+  const backupPath = join(BACKUP_DIR, `mc-backup-${timestamp}${extension}`)
 
   try {
-    const db = getDatabase()
-    await db.backup(backupPath)
-
-    const stat = statSync(backupPath)
+    const stat = isPostgresProvider()
+      ? await createPostgresBackup(backupPath)
+      : await (async () => {
+          const { default: Database } = await import('better-sqlite3')
+          const db = new Database(config.dbPath)
+          try {
+            await db.backup(backupPath)
+          } finally {
+            db.close()
+          }
+          return statSync(backupPath)
+        })()
 
     const ipAddress = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown'
     logAuditEvent({
@@ -118,7 +118,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       success: true,
       backup: {
-        name: `mc-backup-${timestamp}.db`,
+        name: `mc-backup-${timestamp}${extension}`,
         size: stat.size,
         created_at: Math.floor(stat.mtimeMs / 1000),
       },
@@ -133,14 +133,15 @@ export async function POST(request: NextRequest) {
  * DELETE /api/backup?name=<filename> - Delete a specific backup (admin only)
  */
 export async function DELETE(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   let body: any
   try { body = await request.json() } catch { return NextResponse.json({ error: 'Request body required' }, { status: 400 }) }
   const name = body.name
 
-  if (!name || !name.endsWith('.db') || name.includes('/') || name.includes('..')) {
+  const ext = getDatabaseBackupExtension()
+  if (!name || !name.endsWith(ext) || name.includes('/') || name.includes('..')) {
     return NextResponse.json({ error: 'Invalid backup name' }, { status: 400 })
   }
 
@@ -166,7 +167,7 @@ export async function DELETE(request: NextRequest) {
 function pruneOldBackups() {
   try {
     const files = readdirSync(BACKUP_DIR)
-      .filter(f => f.startsWith('mc-backup-') && f.endsWith('.db'))
+      .filter(f => f.startsWith('mc-backup-') && f.endsWith(getDatabaseBackupExtension()))
       .map(f => ({ name: f, mtime: statSync(join(BACKUP_DIR, f)).mtimeMs }))
       .sort((a, b) => b.mtime - a.mtime)
 

@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getDatabase, db_helpers } from '@/lib/db'
+import { db_helpers } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
-import { config } from '@/lib/config'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname, isAbsolute, resolve } from 'node:path'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { dirname } from 'node:path'
 import { resolveWithin } from '@/lib/paths'
 import { getAgentWorkspaceCandidates, readAgentWorkspaceFile } from '@/lib/agent-workspace'
 import { logger } from '@/lib/logger'
+import { getPrismaClient } from '@/lib/prisma'
 
 const ALLOWED_FILES = new Set([
   'agent.md',
@@ -31,31 +31,25 @@ const FILE_ALIASES: Record<string, string[]> = {
   'USER.md': ['USER.md', 'user.md'],
 }
 
-function resolveAgentWorkspacePath(workspace: string): string {
-  if (isAbsolute(workspace)) return resolve(workspace)
-  if (!config.openclawStateDir) throw new Error('OPENCLAW_STATE_DIR not configured')
-  return resolveWithin(config.openclawStateDir, workspace)
-}
-
-function getAgentByIdOrName(db: ReturnType<typeof getDatabase>, id: string, workspaceId: number): any | undefined {
+async function getAgentByIdOrName(id: string, workspaceId: number): Promise<any | null> {
+  const prisma = getPrismaClient()
   if (isNaN(Number(id))) {
-    return db.prepare('SELECT * FROM agents WHERE name = ? AND workspace_id = ?').get(id, workspaceId)
+    return await prisma.agents.findFirst({ where: { name: id, workspace_id: workspaceId } })
   }
-  return db.prepare('SELECT * FROM agents WHERE id = ? AND workspace_id = ?').get(Number(id), workspaceId)
+  return await prisma.agents.findFirst({ where: { id: Number(id), workspace_id: workspaceId } })
 }
 
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
     const { id } = await params
-    const db = getDatabase()
     const workspaceId = auth.user.workspace_id ?? 1
-    const agent = getAgentByIdOrName(db, id, workspaceId)
+    const agent = await getAgentByIdOrName(id, workspaceId)
     if (!agent) return NextResponse.json({ error: 'Agent not found' }, { status: 404 })
 
     const agentConfig = agent.config ? JSON.parse(agent.config) : {}
@@ -94,7 +88,7 @@ export async function PUT(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
@@ -110,9 +104,9 @@ export async function PUT(
       return NextResponse.json({ error: `Unsupported file: ${file}` }, { status: 400 })
     }
 
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const workspaceId = auth.user.workspace_id ?? 1
-    const agent = getAgentByIdOrName(db, id, workspaceId)
+    const agent = await getAgentByIdOrName(id, workspaceId)
     if (!agent) return NextResponse.json({ error: 'Agent not found' }, { status: 404 })
 
     const agentConfig = agent.config ? JSON.parse(agent.config) : {}
@@ -127,12 +121,20 @@ export async function PUT(
     writeFileSync(safePath, content, 'utf-8')
 
     if (file === 'soul.md') {
-      db.prepare('UPDATE agents SET soul_content = ?, updated_at = unixepoch() WHERE id = ? AND workspace_id = ?')
-        .run(content, agent.id, workspaceId)
+      const now = Math.floor(Date.now() / 1000)
+      await prisma.agents.update({
+        where: { id: agent.id },
+        data: { soul_content: content, updated_at: now },
+        select: { id: true },
+      })
     }
     if (file === 'WORKING.md') {
-      db.prepare('UPDATE agents SET working_memory = ?, updated_at = unixepoch() WHERE id = ? AND workspace_id = ?')
-        .run(content, agent.id, workspaceId)
+      const now = Math.floor(Date.now() / 1000)
+      await prisma.agents.update({
+        where: { id: agent.id },
+        data: { working_memory: content, updated_at: now },
+        select: { id: true },
+      })
     }
 
     db_helpers.logActivity(

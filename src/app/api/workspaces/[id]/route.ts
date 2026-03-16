@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
-import { getDatabase, logAuditEvent } from '@/lib/db'
+import { logAuditEvent } from '@/lib/db'
 import { logger } from '@/lib/logger'
+import { getPrismaClient } from '@/lib/prisma'
 
 /**
  * GET /api/workspaces/[id] - Get a single workspace
@@ -10,29 +11,28 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const { id } = await params
     const tenantId = auth.user.tenant_id ?? 1
 
-    const workspace = db.prepare(
-      'SELECT * FROM workspaces WHERE id = ? AND tenant_id = ?'
-    ).get(Number(id), tenantId)
+    const workspaceId = Number(id)
+    const workspace = await prisma.workspaces.findFirst({
+      where: { id: workspaceId, tenant_id: tenantId },
+    })
 
     if (!workspace) {
       return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
     }
 
     // Include agent count
-    const stats = db.prepare(
-      'SELECT COUNT(*) as agent_count FROM agents WHERE workspace_id = ?'
-    ).get(Number(id)) as { agent_count: number }
+    const agentCount = await prisma.agents.count({ where: { workspace_id: workspaceId } })
 
     return NextResponse.json({
-      workspace: { ...(workspace as any), agent_count: stats.agent_count },
+      workspace: { ...(workspace as any), agent_count: agentCount },
     })
   } catch (error) {
     logger.error({ err: error }, 'GET /api/workspaces/[id] error')
@@ -47,11 +47,11 @@ export async function PUT(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const { id } = await params
     const tenantId = auth.user.tenant_id ?? 1
     const body = await request.json()
@@ -61,9 +61,11 @@ export async function PUT(
       return NextResponse.json({ error: 'Name is required' }, { status: 400 })
     }
 
-    const existing = db.prepare(
-      'SELECT * FROM workspaces WHERE id = ? AND tenant_id = ?'
-    ).get(Number(id), tenantId) as any
+    const workspaceId = Number(id)
+    const existing = await prisma.workspaces.findFirst({
+      where: { id: workspaceId, tenant_id: tenantId },
+      select: { id: true, name: true },
+    })
 
     if (!existing) {
       return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
@@ -71,20 +73,21 @@ export async function PUT(
 
     // Don't allow renaming the default workspace slug
     const now = Math.floor(Date.now() / 1000)
-    db.prepare(
-      'UPDATE workspaces SET name = ?, updated_at = ? WHERE id = ? AND tenant_id = ?'
-    ).run(name.trim(), now, Number(id), tenantId)
+    await prisma.workspaces.updateMany({
+      where: { id: workspaceId, tenant_id: tenantId },
+      data: { name: name.trim(), updated_at: now },
+    })
 
     logAuditEvent({
       action: 'workspace_updated',
       actor: auth.user.username,
       actor_id: auth.user.id,
       target_type: 'workspace',
-      target_id: Number(id),
+      target_id: workspaceId,
       detail: { old_name: existing.name, new_name: name.trim() },
     })
 
-    const updated = db.prepare('SELECT * FROM workspaces WHERE id = ?').get(Number(id))
+    const updated = await prisma.workspaces.findUnique({ where: { id: workspaceId } })
     return NextResponse.json({ workspace: updated })
   } catch (error) {
     logger.error({ err: error }, 'PUT /api/workspaces/[id] error')
@@ -99,18 +102,19 @@ export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const { id } = await params
     const tenantId = auth.user.tenant_id ?? 1
     const workspaceId = Number(id)
 
-    const existing = db.prepare(
-      'SELECT * FROM workspaces WHERE id = ? AND tenant_id = ?'
-    ).get(workspaceId, tenantId) as any
+    const existing = await prisma.workspaces.findFirst({
+      where: { id: workspaceId, tenant_id: tenantId },
+      select: { id: true, slug: true, name: true },
+    })
 
     if (!existing) {
       return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
@@ -121,45 +125,47 @@ export async function DELETE(
     }
 
     // Find default workspace to reassign agents
-    const defaultWs = db.prepare(
-      "SELECT id FROM workspaces WHERE slug = 'default' AND tenant_id = ? LIMIT 1"
-    ).get(tenantId) as { id: number } | undefined
+    const defaultWs = await prisma.workspaces.findFirst({
+      where: { slug: 'default', tenant_id: tenantId },
+      select: { id: true },
+    })
 
     const fallbackId = defaultWs?.id ?? 1
+    const now = Math.floor(Date.now() / 1000)
 
-    db.transaction(() => {
-      // Reassign agents to default workspace
-      const moved = db.prepare(
-        'UPDATE agents SET workspace_id = ?, updated_at = ? WHERE workspace_id = ?'
-      ).run(fallbackId, Math.floor(Date.now() / 1000), workspaceId)
-
-      // Reassign users to default workspace
-      db.prepare(
-        'UPDATE users SET workspace_id = ?, updated_at = ? WHERE workspace_id = ?'
-      ).run(fallbackId, Math.floor(Date.now() / 1000), workspaceId)
-
-      // Reassign projects to default workspace
-      db.prepare(
-        'UPDATE projects SET workspace_id = ?, updated_at = ? WHERE workspace_id = ?'
-      ).run(fallbackId, Math.floor(Date.now() / 1000), workspaceId)
-
-      // Delete workspace
-      db.prepare('DELETE FROM workspaces WHERE id = ?').run(workspaceId)
-
-      logAuditEvent({
-        action: 'workspace_deleted',
-        actor: auth.user.username,
-        actor_id: auth.user.id,
-        target_type: 'workspace',
-        target_id: workspaceId,
-        detail: {
-          name: existing.name,
-          slug: existing.slug,
-          agents_moved: (moved as any).changes,
-          moved_to_workspace: fallbackId,
-        },
+    const moved = await prisma.$transaction(async (tx) => {
+      const movedAgents = await tx.agents.updateMany({
+        where: { workspace_id: workspaceId },
+        data: { workspace_id: fallbackId, updated_at: now },
       })
-    })()
+
+      await tx.users.updateMany({
+        where: { workspace_id: workspaceId },
+        data: { workspace_id: fallbackId, updated_at: now },
+      })
+
+      await tx.projects.updateMany({
+        where: { workspace_id: workspaceId },
+        data: { workspace_id: fallbackId, updated_at: now },
+      })
+
+      await tx.workspaces.deleteMany({ where: { id: workspaceId, tenant_id: tenantId } })
+      return movedAgents.count
+    })
+
+    logAuditEvent({
+      action: 'workspace_deleted',
+      actor: auth.user.username,
+      actor_id: auth.user.id,
+      target_type: 'workspace',
+      target_id: workspaceId,
+      detail: {
+        name: existing.name,
+        slug: existing.slug,
+        agents_moved: moved,
+        moved_to_workspace: fallbackId,
+      },
+    })
 
     return NextResponse.json({
       success: true,

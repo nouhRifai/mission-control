@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
-import { getDatabase, logAuditEvent } from '@/lib/db'
+import { logAuditEvent } from '@/lib/db'
 import { config } from '@/lib/config'
 import { heavyLimiter } from '@/lib/rate-limit'
 import { countStaleGatewaySessions, pruneGatewaySessionsOlderThan } from '@/lib/sessions'
+import { getPrismaClient } from '@/lib/prisma'
 
 interface CleanupResult {
   table: string
@@ -16,31 +17,30 @@ interface CleanupResult {
  * GET /api/cleanup - Show retention policy and what would be cleaned
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
-  const db = getDatabase()
+  const prisma = getPrismaClient()
   const workspaceId = auth.user.workspace_id ?? 1
   const now = Math.floor(Date.now() / 1000)
   const ret = config.retention
 
   const preview = []
 
-  for (const { table, column, days, label, scoped } of getRetentionTargets()) {
+  for (const target of getRetentionTargets()) {
+    const { days, label, scoped } = target
     if (days <= 0) {
       preview.push({ table: label, retention_days: 0, stale_count: 0, note: 'Retention disabled (keep forever)' })
       continue
     }
     const cutoff = now - days * 86400
     try {
-      const wsClause = scoped ? ' AND workspace_id = ?' : ''
-      const params: any[] = scoped ? [cutoff, workspaceId] : [cutoff]
-      const row = db.prepare(`SELECT COUNT(*) as c FROM ${table} WHERE ${column} < ?${wsClause}`).get(...params) as any
+      const stale_count = await countStaleForTarget(prisma, target.key, cutoff, scoped ? workspaceId : null)
       preview.push({
         table: label,
         retention_days: days,
         cutoff_date: new Date(cutoff * 1000).toISOString().split('T')[0],
-        stale_count: row.c,
+        stale_count,
       })
     } catch {
       preview.push({ table: label, retention_days: days, stale_count: 0, note: 'Table not found' })
@@ -82,7 +82,7 @@ export async function GET(request: NextRequest) {
  * Body: { dry_run?: boolean }
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = heavyLimiter(request)
@@ -91,37 +91,36 @@ export async function POST(request: NextRequest) {
   const body = await request.json().catch(() => ({}))
   const dryRun = body.dry_run === true
 
-  const db = getDatabase()
+  const prisma = getPrismaClient()
   const workspaceId = auth.user.workspace_id ?? 1
   const now = Math.floor(Date.now() / 1000)
   const results: CleanupResult[] = []
   let totalDeleted = 0
 
-  for (const { table, column, days, label, scoped } of getRetentionTargets()) {
+  for (const target of getRetentionTargets()) {
+    const { days, label, scoped } = target
     if (days <= 0) continue
     const cutoff = now - days * 86400
-    const wsClause = scoped ? ' AND workspace_id = ?' : ''
-    const params: any[] = scoped ? [cutoff, workspaceId] : [cutoff]
 
     try {
       if (dryRun) {
-        const row = db.prepare(`SELECT COUNT(*) as c FROM ${table} WHERE ${column} < ?${wsClause}`).get(...params) as any
+        const stale_count = await countStaleForTarget(prisma, target.key, cutoff, scoped ? workspaceId : null)
         results.push({
           table: label,
-          deleted: row.c,
+          deleted: stale_count,
           cutoff_date: new Date(cutoff * 1000).toISOString().split('T')[0],
           retention_days: days,
         })
-        totalDeleted += row.c
+        totalDeleted += stale_count
       } else {
-        const res = db.prepare(`DELETE FROM ${table} WHERE ${column} < ?${wsClause}`).run(...params)
+        const deleted = await deleteStaleForTarget(prisma, target.key, cutoff, scoped ? workspaceId : null)
         results.push({
           table: label,
-          deleted: res.changes,
+          deleted,
           cutoff_date: new Date(cutoff * 1000).toISOString().split('T')[0],
           retention_days: days,
         })
-        totalDeleted += res.changes
+        totalDeleted += deleted
       }
     } catch {
       results.push({ table: label, deleted: 0, cutoff_date: '', retention_days: days })
@@ -188,10 +187,72 @@ export async function POST(request: NextRequest) {
 
 function getRetentionTargets() {
   const ret = config.retention
-  return [
-    { table: 'activities', column: 'created_at', days: ret.activities, label: 'Activities', scoped: true },
-    { table: 'audit_log', column: 'created_at', days: ret.auditLog, label: 'Audit Log', scoped: false }, // instance-global, admin-only
-    { table: 'notifications', column: 'created_at', days: ret.notifications, label: 'Notifications', scoped: true },
-    { table: 'pipeline_runs', column: 'created_at', days: ret.pipelineRuns, label: 'Pipeline Runs', scoped: true },
+  const targets: Array<{
+    key: 'activities' | 'audit_log' | 'notifications' | 'pipeline_runs'
+    days: number
+    label: string
+    scoped: boolean
+  }> = [
+    { key: 'activities', days: ret.activities, label: 'Activities', scoped: true },
+    { key: 'audit_log', days: ret.auditLog, label: 'Audit Log', scoped: false }, // instance-global, admin-only
+    { key: 'notifications', days: ret.notifications, label: 'Notifications', scoped: true },
+    { key: 'pipeline_runs', days: ret.pipelineRuns, label: 'Pipeline Runs', scoped: true },
   ]
+  return targets
+}
+
+async function countStaleForTarget(
+  prisma: ReturnType<typeof getPrismaClient>,
+  key: 'activities' | 'audit_log' | 'notifications' | 'pipeline_runs',
+  cutoff: number,
+  workspaceId: number | null
+): Promise<number> {
+  switch (key) {
+    case 'activities':
+      return prisma.activities.count({
+        where: { created_at: { lt: cutoff }, ...(workspaceId != null ? { workspace_id: workspaceId } : {}) } as any,
+      })
+    case 'audit_log':
+      return prisma.audit_log.count({ where: { created_at: { lt: cutoff } } as any })
+    case 'notifications':
+      return prisma.notifications.count({
+        where: { created_at: { lt: cutoff }, ...(workspaceId != null ? { workspace_id: workspaceId } : {}) } as any,
+      })
+    case 'pipeline_runs':
+      return prisma.pipeline_runs.count({
+        where: { created_at: { lt: cutoff }, ...(workspaceId != null ? { workspace_id: workspaceId } : {}) } as any,
+      })
+  }
+}
+
+async function deleteStaleForTarget(
+  prisma: ReturnType<typeof getPrismaClient>,
+  key: 'activities' | 'audit_log' | 'notifications' | 'pipeline_runs',
+  cutoff: number,
+  workspaceId: number | null
+): Promise<number> {
+  switch (key) {
+    case 'activities': {
+      const res = await prisma.activities.deleteMany({
+        where: { created_at: { lt: cutoff }, ...(workspaceId != null ? { workspace_id: workspaceId } : {}) } as any,
+      })
+      return res.count
+    }
+    case 'audit_log': {
+      const res = await prisma.audit_log.deleteMany({ where: { created_at: { lt: cutoff } } as any })
+      return res.count
+    }
+    case 'notifications': {
+      const res = await prisma.notifications.deleteMany({
+        where: { created_at: { lt: cutoff }, ...(workspaceId != null ? { workspace_id: workspaceId } : {}) } as any,
+      })
+      return res.count
+    }
+    case 'pipeline_runs': {
+      const res = await prisma.pipeline_runs.deleteMany({
+        where: { created_at: { lt: cutoff }, ...(workspaceId != null ? { workspace_id: workspaceId } : {}) } as any,
+      })
+      return res.count
+    }
+  }
 }

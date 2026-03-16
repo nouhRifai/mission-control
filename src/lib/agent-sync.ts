@@ -6,13 +6,14 @@
  */
 
 import { config } from './config'
-import { getDatabase, db_helpers, logAuditEvent } from './db'
+import { logAuditEvent } from './db'
 import { eventBus } from './event-bus'
 import { join, isAbsolute, resolve } from 'path'
 import { existsSync, readFileSync, statSync } from 'fs'
 import { resolveWithin } from './paths'
 import { logger } from './logger'
 import { parseJsonRelaxed } from './json-relaxed'
+import { getPrismaClient } from './prisma'
 
 interface OpenClawAgent {
   id: string
@@ -238,50 +239,62 @@ export async function syncAgentsFromConfig(actor: string = 'system'): Promise<Sy
     return { synced: 0, created: 0, updated: 0, agents: [] }
   }
 
-  const db = getDatabase()
+  const prisma = getPrismaClient()
+  const workspaceId = 1
   const now = Math.floor(Date.now() / 1000)
   let created = 0
   let updated = 0
   const results: SyncResult['agents'] = []
 
-  const findByName = db.prepare('SELECT id, name, role, config, soul_content FROM agents WHERE name = ?')
-  const insertAgent = db.prepare(`
-    INSERT INTO agents (name, role, soul_content, status, created_at, updated_at, config)
-    VALUES (?, ?, ?, 'offline', ?, ?, ?)
-  `)
-  const updateAgent = db.prepare(`
-    UPDATE agents SET role = ?, config = ?, soul_content = ?, updated_at = ? WHERE name = ?
-  `)
+  const existingAgents = await prisma.agents.findMany({
+    where: { workspace_id: workspaceId },
+    select: { id: true, name: true, role: true, config: true, soul_content: true },
+  }) as any[]
+  const byName = new Map(existingAgents.map((row) => [row.name, row]))
 
-  db.transaction(() => {
+  await prisma.$transaction(async (tx) => {
     for (const agent of agents) {
       const mapped = mapAgentToMC(agent)
       const configJson = JSON.stringify(mapped.config)
-      const existing = findByName.get(mapped.name) as any
+      const existing = byName.get(mapped.name)
 
       if (existing) {
-        // Check if config or soul_content actually changed
         const existingConfig = existing.config || '{}'
         const existingSoul = existing.soul_content || null
         const configChanged = existingConfig !== configJson || existing.role !== mapped.role
         const soulChanged = mapped.soul_content !== null && mapped.soul_content !== existingSoul
 
         if (configChanged || soulChanged) {
-          // Only overwrite soul_content if we read a new value from workspace
           const soulToWrite = mapped.soul_content ?? existingSoul
-          updateAgent.run(mapped.role, configJson, soulToWrite, now, mapped.name)
+          await tx.agents.update({
+            where: { id: existing.id },
+            data: { role: mapped.role, config: configJson, soul_content: soulToWrite, updated_at: now },
+            select: { id: true },
+          })
           results.push({ id: agent.id, name: mapped.name, action: 'updated' })
           updated++
         } else {
           results.push({ id: agent.id, name: mapped.name, action: 'unchanged' })
         }
       } else {
-        insertAgent.run(mapped.name, mapped.role, mapped.soul_content, now, now, configJson)
+        await tx.agents.create({
+          data: {
+            name: mapped.name,
+            role: mapped.role,
+            soul_content: mapped.soul_content,
+            status: 'offline',
+            created_at: now,
+            updated_at: now,
+            config: configJson,
+            workspace_id: workspaceId,
+          },
+          select: { id: true },
+        })
         results.push({ id: agent.id, name: mapped.name, action: 'created' })
         created++
       }
     }
-  })()
+  })
 
   const synced = agents.length
 
@@ -310,8 +323,12 @@ export async function previewSyncDiff(): Promise<SyncDiff> {
     return { inConfig: 0, inMC: 0, newAgents: [], updatedAgents: [], onlyInMC: [] }
   }
 
-  const db = getDatabase()
-  const allMCAgents = db.prepare('SELECT name, role, config FROM agents').all() as Array<{ name: string; role: string; config: string }>
+  const prisma = getPrismaClient()
+  const workspaceId = 1
+  const allMCAgents = await prisma.agents.findMany({
+    where: { workspace_id: workspaceId },
+    select: { name: true, role: true, config: true },
+  }) as Array<{ name: string; role: string; config: string }>
   const mcNames = new Set(allMCAgents.map(a => a.name))
 
   const newAgents: string[] = []

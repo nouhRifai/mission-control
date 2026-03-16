@@ -15,8 +15,9 @@ import { createHash } from 'node:crypto'
 import { readdirSync, readFileSync, statSync, existsSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { getDatabase, logAuditEvent } from './db'
+import { logAuditEvent } from './db'
 import { logger } from './logger'
+import { getPrismaClient } from './prisma'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -224,7 +225,7 @@ function scanLocalAgents(): DiskAgent[] {
 
 export async function syncLocalAgents(): Promise<{ ok: boolean; message: string }> {
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const diskAgents = scanLocalAgents()
     const now = Math.floor(Date.now() / 1000)
 
@@ -234,9 +235,20 @@ export async function syncLocalAgents(): Promise<{ ok: boolean; message: string 
     }
 
     // Fetch DB agents with source='local'
-    const dbRows = db.prepare(
-      `SELECT id, name, role, soul_content, status, source, content_hash, workspace_path, config FROM agents WHERE source = 'local'`
-    ).all() as AgentRow[]
+    const dbRows = await prisma.agents.findMany({
+      where: { source: 'local' },
+      select: {
+        id: true,
+        name: true,
+        role: true,
+        soul_content: true,
+        status: true,
+        source: true,
+        content_hash: true,
+        workspace_path: true,
+        config: true,
+      },
+    }) as unknown as AgentRow[]
 
     const dbMap = new Map<string, AgentRow>()
     for (const r of dbRows) {
@@ -247,29 +259,43 @@ export async function syncLocalAgents(): Promise<{ ok: boolean; message: string 
     let updated = 0
     let removed = 0
 
-    const insertStmt = db.prepare(`
-      INSERT INTO agents (name, role, soul_content, status, source, content_hash, workspace_path, config, created_at, updated_at)
-      VALUES (?, ?, ?, 'offline', 'local', ?, ?, ?, ?, ?)
-    `)
-    const updateStmt = db.prepare(`
-      UPDATE agents SET role = ?, soul_content = ?, content_hash = ?, workspace_path = ?, config = ?, updated_at = ?
-      WHERE id = ?
-    `)
-    const markRemovedStmt = db.prepare(`
-      UPDATE agents SET status = 'offline', updated_at = ? WHERE id = ?
-    `)
-
-    db.transaction(() => {
+    await prisma.$transaction(async (tx) => {
       // Disk → DB: additions and changes
       for (const [name, disk] of diskMap) {
         const existing = dbMap.get(name)
         const configJson = disk.configContent ? disk.configContent : null
 
         if (!existing) {
-          insertStmt.run(name, disk.role, disk.soulContent, disk.contentHash, disk.dir, configJson, now, now)
+          await tx.agents.create({
+            data: {
+              name,
+              role: disk.role,
+              soul_content: disk.soulContent,
+              status: 'offline',
+              source: 'local',
+              content_hash: disk.contentHash,
+              workspace_path: disk.dir,
+              config: configJson,
+              created_at: now,
+              updated_at: now,
+              workspace_id: 1,
+            },
+            select: { id: true },
+          })
           created++
         } else if (existing.content_hash !== disk.contentHash) {
-          updateStmt.run(disk.role, disk.soulContent, disk.contentHash, disk.dir, configJson, now, existing.id)
+          await tx.agents.update({
+            where: { id: existing.id },
+            data: {
+              role: disk.role,
+              soul_content: disk.soulContent,
+              content_hash: disk.contentHash,
+              workspace_path: disk.dir,
+              config: configJson,
+              updated_at: now,
+            },
+            select: { id: true },
+          })
           updated++
         }
       }
@@ -277,11 +303,15 @@ export async function syncLocalAgents(): Promise<{ ok: boolean; message: string 
       // Agents that vanished from disk — mark offline but don't delete
       for (const [name, row] of dbMap) {
         if (!diskMap.has(name) && row.status !== 'offline') {
-          markRemovedStmt.run(now, row.id)
+          await tx.agents.update({
+            where: { id: row.id },
+            data: { status: 'offline', updated_at: now },
+            select: { id: true },
+          })
           removed++
         }
       }
-    })()
+    })
 
     const msg = `Local agent sync: ${created} added, ${updated} updated, ${removed} marked offline (${diskAgents.length} on disk)`
     if (created > 0 || updated > 0 || removed > 0) {
@@ -314,9 +344,14 @@ export function writeLocalAgentSoul(agentDir: string, soulContent: string): void
 
   // Update the DB hash so the next sync doesn't re-overwrite
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const hash = sha256(soulContent)
-    db.prepare(`UPDATE agents SET content_hash = ?, updated_at = ? WHERE workspace_path = ? AND source = 'local'`)
-      .run(hash, Math.floor(Date.now() / 1000), agentDir)
+    const now = Math.floor(Date.now() / 1000)
+    void prisma.agents.updateMany({
+      where: { workspace_path: agentDir, source: 'local' },
+      data: { content_hash: hash, updated_at: now },
+    }).catch(() => {
+      // ignore
+    })
   } catch { /* best-effort */ }
 }

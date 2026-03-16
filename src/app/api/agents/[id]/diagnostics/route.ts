@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDatabase } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
 import { logger } from '@/lib/logger';
+import { getPrismaClient } from '@/lib/prisma';
 
 const ALLOWED_SECTIONS = ['summary', 'tasks', 'errors', 'activity', 'trends', 'tokens'] as const;
 type DiagnosticsSection = (typeof ALLOWED_SECTIONS)[number];
@@ -63,11 +63,11 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'viewer');
+  const auth = await requireRole(request, 'viewer');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const resolvedParams = await params;
     const agentId = resolvedParams.id;
     const workspaceId = auth.user.workspace_id ?? 1;
@@ -75,9 +75,15 @@ export async function GET(
     // Resolve agent by ID or name
     let agent: any;
     if (/^\d+$/.test(agentId)) {
-      agent = db.prepare('SELECT id, name, role, status, last_seen, created_at FROM agents WHERE id = ? AND workspace_id = ?').get(Number(agentId), workspaceId);
+      agent = await prisma.agents.findFirst({
+        where: { id: Number(agentId), workspace_id: workspaceId },
+        select: { id: true, name: true, role: true, status: true, last_seen: true, created_at: true },
+      })
     } else {
-      agent = db.prepare('SELECT id, name, role, status, last_seen, created_at FROM agents WHERE name = ? AND workspace_id = ?').get(agentId, workspaceId);
+      agent = await prisma.agents.findFirst({
+        where: { name: agentId, workspace_id: workspaceId },
+        select: { id: true, name: true, role: true, status: true, last_seen: true, created_at: true },
+      })
     }
 
     if (!agent) {
@@ -119,27 +125,27 @@ export async function GET(
     };
 
     if (sections.has('summary')) {
-      result.summary = buildSummary(db, agent.name, workspaceId, since);
+      result.summary = await buildSummary(prisma, agent.name, workspaceId, since);
     }
 
     if (sections.has('tasks')) {
-      result.tasks = buildTaskMetrics(db, agent.name, workspaceId, since);
+      result.tasks = await buildTaskMetrics(prisma, agent.name, workspaceId, since);
     }
 
     if (sections.has('errors')) {
-      result.errors = buildErrorAnalysis(db, agent.name, workspaceId, since);
+      result.errors = await buildErrorAnalysis(prisma, agent.name, workspaceId, since);
     }
 
     if (sections.has('activity')) {
-      result.activity = buildActivityBreakdown(db, agent.name, workspaceId, since);
+      result.activity = await buildActivityBreakdown(prisma, agent.name, workspaceId, since);
     }
 
     if (sections.has('trends')) {
-      result.trends = buildTrends(db, agent.name, workspaceId, hours);
+      result.trends = await buildTrends(prisma, agent.name, workspaceId, hours);
     }
 
     if (sections.has('tokens')) {
-      result.tokens = buildTokenMetrics(db, agent.name, workspaceId, since);
+      result.tokens = await buildTokenMetrics(prisma, agent.name, workspaceId, since);
     }
 
     return NextResponse.json(result);
@@ -150,22 +156,26 @@ export async function GET(
 }
 
 /** High-level KPIs */
-function buildSummary(db: any, agentName: string, workspaceId: number, since: number) {
-  const tasksDone = (db.prepare(
-    `SELECT COUNT(*) as c FROM tasks WHERE assigned_to = ? AND workspace_id = ? AND status = 'done' AND updated_at >= ?`
-  ).get(agentName, workspaceId, since) as any).c;
-
-  const tasksTotal = (db.prepare(
-    `SELECT COUNT(*) as c FROM tasks WHERE assigned_to = ? AND workspace_id = ?`
-  ).get(agentName, workspaceId) as any).c;
-
-  const activityCount = (db.prepare(
-    `SELECT COUNT(*) as c FROM activities WHERE actor = ? AND workspace_id = ? AND created_at >= ?`
-  ).get(agentName, workspaceId, since) as any).c;
-
-  const errorCount = (db.prepare(
-    `SELECT COUNT(*) as c FROM activities WHERE actor = ? AND workspace_id = ? AND created_at >= ? AND type LIKE '%error%'`
-  ).get(agentName, workspaceId, since) as any).c;
+async function buildSummary(prisma: any, agentName: string, workspaceId: number, since: number) {
+  const [tasksDone, tasksTotal, activityCount, errorCount] = await Promise.all([
+    prisma.tasks.count({
+      where: { assigned_to: agentName, workspace_id: workspaceId, status: 'done', updated_at: { gte: since } },
+    }),
+    prisma.tasks.count({
+      where: { assigned_to: agentName, workspace_id: workspaceId },
+    }),
+    prisma.activities.count({
+      where: { actor: agentName, workspace_id: workspaceId, created_at: { gte: since } },
+    }),
+    prisma.activities.count({
+      where: {
+        actor: agentName,
+        workspace_id: workspaceId,
+        created_at: { gte: since },
+        type: { contains: 'error' },
+      },
+    }),
+  ])
 
   const errorRate = activityCount > 0 ? Math.round((errorCount / activityCount) * 10000) / 100 : 0;
 
@@ -179,18 +189,25 @@ function buildSummary(db: any, agentName: string, workspaceId: number, since: nu
 }
 
 /** Task completion breakdown */
-function buildTaskMetrics(db: any, agentName: string, workspaceId: number, since: number) {
-  const byStatus = db.prepare(
-    `SELECT status, COUNT(*) as count FROM tasks WHERE assigned_to = ? AND workspace_id = ? GROUP BY status`
-  ).all(agentName, workspaceId) as Array<{ status: string; count: number }>;
-
-  const byPriority = db.prepare(
-    `SELECT priority, COUNT(*) as count FROM tasks WHERE assigned_to = ? AND workspace_id = ? GROUP BY priority`
-  ).all(agentName, workspaceId) as Array<{ priority: string; count: number }>;
-
-  const recentCompleted = db.prepare(
-    `SELECT id, title, priority, updated_at FROM tasks WHERE assigned_to = ? AND workspace_id = ? AND status = 'done' AND updated_at >= ? ORDER BY updated_at DESC LIMIT 10`
-  ).all(agentName, workspaceId, since) as any[];
+async function buildTaskMetrics(prisma: any, agentName: string, workspaceId: number, since: number) {
+  const [byStatus, byPriority, recentCompleted] = await Promise.all([
+    prisma.tasks.groupBy({
+      by: ['status'],
+      where: { assigned_to: agentName, workspace_id: workspaceId },
+      _count: { _all: true },
+    }),
+    prisma.tasks.groupBy({
+      by: ['priority'],
+      where: { assigned_to: agentName, workspace_id: workspaceId },
+      _count: { _all: true },
+    }),
+    prisma.tasks.findMany({
+      where: { assigned_to: agentName, workspace_id: workspaceId, status: 'done', updated_at: { gte: since } },
+      select: { id: true, title: true, priority: true, updated_at: true },
+      orderBy: { updated_at: 'desc' },
+      take: 10,
+    }),
+  ])
 
   // Estimate throughput: tasks completed per day in the window
   const windowDays = Math.max((Math.floor(Date.now() / 1000) - since) / 86400, 1);
@@ -198,27 +215,44 @@ function buildTaskMetrics(db: any, agentName: string, workspaceId: number, since
   const throughputPerDay = Math.round((completedInWindow / windowDays) * 100) / 100;
 
   return {
-    by_status: Object.fromEntries(byStatus.map(r => [r.status, r.count])),
-    by_priority: Object.fromEntries(byPriority.map(r => [r.priority, r.count])),
+    by_status: Object.fromEntries(byStatus.map((r: any) => [r.status, r._count?._all ?? 0])),
+    by_priority: Object.fromEntries(byPriority.map((r: any) => [r.priority, r._count?._all ?? 0])),
     recent_completed: recentCompleted,
     throughput_per_day: throughputPerDay,
   };
 }
 
 /** Error frequency and analysis */
-function buildErrorAnalysis(db: any, agentName: string, workspaceId: number, since: number) {
-  const errorActivities = db.prepare(
-    `SELECT type, COUNT(*) as count FROM activities WHERE actor = ? AND workspace_id = ? AND created_at >= ? AND (type LIKE '%error%' OR type LIKE '%fail%') GROUP BY type ORDER BY count DESC`
-  ).all(agentName, workspaceId, since) as Array<{ type: string; count: number }>;
-
-  const recentErrors = db.prepare(
-    `SELECT id, type, description, data, created_at FROM activities WHERE actor = ? AND workspace_id = ? AND created_at >= ? AND (type LIKE '%error%' OR type LIKE '%fail%') ORDER BY created_at DESC LIMIT 20`
-  ).all(agentName, workspaceId, since) as any[];
+async function buildErrorAnalysis(prisma: any, agentName: string, workspaceId: number, since: number) {
+  const [errorActivities, recentErrors] = await Promise.all([
+    prisma.activities.groupBy({
+      by: ['type'],
+      where: {
+        actor: agentName,
+        workspace_id: workspaceId,
+        created_at: { gte: since },
+        OR: [{ type: { contains: 'error' } }, { type: { contains: 'fail' } }],
+      },
+      _count: { id: true },
+      orderBy: { _count: { id: 'desc' } },
+    }),
+    prisma.activities.findMany({
+      where: {
+        actor: agentName,
+        workspace_id: workspaceId,
+        created_at: { gte: since },
+        OR: [{ type: { contains: 'error' } }, { type: { contains: 'fail' } }],
+      },
+      select: { id: true, type: true, description: true, data: true, created_at: true },
+      orderBy: { created_at: 'desc' },
+      take: 20,
+    }),
+  ])
 
   return {
-    by_type: errorActivities,
-    total: errorActivities.reduce((sum, e) => sum + e.count, 0),
-    recent: recentErrors.map(e => ({
+    by_type: errorActivities.map((row: any) => ({ type: row.type, count: row._count?.id ?? 0 })),
+    total: errorActivities.reduce((sum: number, e: any) => sum + (e._count?.id ?? 0), 0),
+    recent: recentErrors.map((e: any) => ({
       ...e,
       data: e.data ? JSON.parse(e.data) : null,
     })),
@@ -226,17 +260,31 @@ function buildErrorAnalysis(db: any, agentName: string, workspaceId: number, sin
 }
 
 /** Activity breakdown with hourly timeline */
-function buildActivityBreakdown(db: any, agentName: string, workspaceId: number, since: number) {
-  const byType = db.prepare(
-    `SELECT type, COUNT(*) as count FROM activities WHERE actor = ? AND workspace_id = ? AND created_at >= ? GROUP BY type ORDER BY count DESC`
-  ).all(agentName, workspaceId, since) as Array<{ type: string; count: number }>;
+async function buildActivityBreakdown(prisma: any, agentName: string, workspaceId: number, since: number) {
+  const activities = await prisma.activities.findMany({
+    where: { actor: agentName, workspace_id: workspaceId, created_at: { gte: since } },
+    select: { type: true, created_at: true },
+    orderBy: { created_at: 'asc' },
+  })
 
-  const timeline = db.prepare(
-    `SELECT (created_at / 3600) * 3600 as hour_bucket, COUNT(*) as count FROM activities WHERE actor = ? AND workspace_id = ? AND created_at >= ? GROUP BY hour_bucket ORDER BY hour_bucket ASC`
-  ).all(agentName, workspaceId, since) as Array<{ hour_bucket: number; count: number }>;
+  const byType = new Map<string, number>()
+  const byHour = new Map<number, number>()
+  for (const activity of activities) {
+    byType.set(activity.type, (byType.get(activity.type) ?? 0) + 1)
+    const bucket = Math.floor(activity.created_at / 3600) * 3600
+    byHour.set(bucket, (byHour.get(bucket) ?? 0) + 1)
+  }
+
+  const byTypeRows = Array.from(byType.entries())
+    .map(([type, count]) => ({ type, count }))
+    .sort((a, b) => b.count - a.count)
+
+  const timeline = Array.from(byHour.entries())
+    .map(([hour_bucket, count]) => ({ hour_bucket, count }))
+    .sort((a, b) => a.hour_bucket - b.hour_bucket)
 
   return {
-    by_type: byType,
+    by_type: byTypeRows,
     timeline: timeline.map(t => ({
       timestamp: t.hour_bucket,
       hour: new Date(t.hour_bucket * 1000).toISOString(),
@@ -246,31 +294,35 @@ function buildActivityBreakdown(db: any, agentName: string, workspaceId: number,
 }
 
 /** Multi-period trend comparison for anomaly/trend detection */
-function buildTrends(db: any, agentName: string, workspaceId: number, hours: number) {
+async function buildTrends(prisma: any, agentName: string, workspaceId: number, hours: number) {
   const now = Math.floor(Date.now() / 1000);
 
   // Compare current period vs previous period of same length
   const currentSince = now - hours * 3600;
   const previousSince = currentSince - hours * 3600;
 
-  const periodMetrics = (since: number, until: number) => {
-    const activities = (db.prepare(
-      `SELECT COUNT(*) as c FROM activities WHERE actor = ? AND workspace_id = ? AND created_at >= ? AND created_at < ?`
-    ).get(agentName, workspaceId, since, until) as any).c;
-
-    const errors = (db.prepare(
-      `SELECT COUNT(*) as c FROM activities WHERE actor = ? AND workspace_id = ? AND created_at >= ? AND created_at < ? AND (type LIKE '%error%' OR type LIKE '%fail%')`
-    ).get(agentName, workspaceId, since, until) as any).c;
-
-    const tasksCompleted = (db.prepare(
-      `SELECT COUNT(*) as c FROM tasks WHERE assigned_to = ? AND workspace_id = ? AND status = 'done' AND updated_at >= ? AND updated_at < ?`
-    ).get(agentName, workspaceId, since, until) as any).c;
-
+  const periodMetrics = async (since: number, until: number) => {
+    const [activities, errors, tasksCompleted] = await Promise.all([
+      prisma.activities.count({
+        where: { actor: agentName, workspace_id: workspaceId, created_at: { gte: since, lt: until } },
+      }),
+      prisma.activities.count({
+        where: {
+          actor: agentName,
+          workspace_id: workspaceId,
+          created_at: { gte: since, lt: until },
+          OR: [{ type: { contains: 'error' } }, { type: { contains: 'fail' } }],
+        },
+      }),
+      prisma.tasks.count({
+        where: { assigned_to: agentName, workspace_id: workspaceId, status: 'done', updated_at: { gte: since, lt: until } },
+      }),
+    ])
     return { activities, errors, tasks_completed: tasksCompleted };
   };
 
-  const current = periodMetrics(currentSince, now);
-  const previous = periodMetrics(previousSince, currentSince);
+  const current = await periodMetrics(currentSince, now);
+  const previous = await periodMetrics(previousSince, currentSince);
 
   const pctChange = (cur: number, prev: number) => {
     if (prev === 0) return cur > 0 ? 100 : 0;
@@ -319,21 +371,32 @@ function buildTrendAlerts(current: { activities: number; errors: number; tasks_c
 }
 
 /** Token usage by model */
-function buildTokenMetrics(db: any, agentName: string, workspaceId: number, since: number) {
+async function buildTokenMetrics(prisma: any, agentName: string, workspaceId: number, since: number) {
   try {
     // session_id on token_usage may store agent name or session key
-    const byModel = db.prepare(
-      `SELECT model, SUM(input_tokens) as input_tokens, SUM(output_tokens) as output_tokens, COUNT(*) as request_count FROM token_usage WHERE session_id = ? AND workspace_id = ? AND created_at >= ? GROUP BY model ORDER BY (input_tokens + output_tokens) DESC`
-    ).all(agentName, workspaceId, since) as Array<{ model: string; input_tokens: number; output_tokens: number; request_count: number }>;
+    const byModel = await prisma.token_usage.groupBy({
+      by: ['model'],
+      where: { session_id: agentName, workspace_id: workspaceId, created_at: { gte: since } },
+      _sum: { input_tokens: true, output_tokens: true },
+      _count: { _all: true },
+      orderBy: { _sum: { input_tokens: 'desc' } },
+    })
 
-    const total = byModel.reduce((acc, r) => ({
+    const rows = byModel.map((row: any) => ({
+      model: row.model,
+      input_tokens: row._sum?.input_tokens ?? 0,
+      output_tokens: row._sum?.output_tokens ?? 0,
+      request_count: row._count?._all ?? 0,
+    })).sort((a: any, b: any) => (b.input_tokens + b.output_tokens) - (a.input_tokens + a.output_tokens))
+
+    const total = rows.reduce((acc: any, r: any) => ({
       input_tokens: acc.input_tokens + r.input_tokens,
       output_tokens: acc.output_tokens + r.output_tokens,
       requests: acc.requests + r.request_count,
     }), { input_tokens: 0, output_tokens: 0, requests: 0 });
 
     return {
-      by_model: byModel,
+      by_model: rows,
       total,
     };
   } catch {

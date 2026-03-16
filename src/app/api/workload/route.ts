@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDatabase } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
 import { logger } from '@/lib/logger';
+import { getPrismaClient } from '@/lib/prisma';
 
 /**
  * GET /api/workload - Real-Time Workload Signals
@@ -20,22 +20,22 @@ import { logger } from '@/lib/logger';
  * cascading failures and SLO breaches.
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer');
+  const auth = await requireRole(request, 'viewer');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const workspaceId = auth.user.workspace_id ?? 1;
     const now = Math.floor(Date.now() / 1000);
 
     // --- Capacity metrics ---
-    const capacity = buildCapacityMetrics(db, workspaceId, now);
+    const capacity = await buildCapacityMetrics(prisma, workspaceId, now);
 
     // --- Queue depth ---
-    const queue = buildQueueMetrics(db, workspaceId);
+    const queue = await buildQueueMetrics(prisma, workspaceId);
 
     // --- Agent availability ---
-    const agents = buildAgentMetrics(db, workspaceId, now);
+    const agents = await buildAgentMetrics(prisma, workspaceId, now);
 
     // --- Recommendation ---
     const recommendation = computeRecommendation(capacity, queue, agents);
@@ -106,35 +106,52 @@ interface AgentMetrics {
   load_distribution: Array<{ agent: string; assigned: number; in_progress: number }>;
 }
 
-function buildCapacityMetrics(db: any, workspaceId: number, now: number): CapacityMetrics {
+function toNumber(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'bigint') return Number(value)
+  if (typeof value === 'string') {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : 0
+  }
+  return 0
+}
+
+async function buildCapacityMetrics(prisma: ReturnType<typeof getPrismaClient>, workspaceId: number, now: number): Promise<CapacityMetrics> {
   const recentWindow = now - THRESHOLDS.recent_window_seconds;
   const hourAgo = now - 3600;
 
-  const activeTasks = (db.prepare(
-    `SELECT COUNT(*) as c FROM tasks WHERE workspace_id = ? AND status IN ('assigned', 'in_progress', 'review', 'quality_review')`
-  ).get(workspaceId) as any).c;
+  const [activeTasks, tasksLast5m, totalLast5m, completionsLastHour] = await Promise.all([
+    prisma.tasks.count({
+      where: { workspace_id: workspaceId, status: { in: ['assigned', 'in_progress', 'review', 'quality_review'] } },
+    }),
+    prisma.activities.count({
+      where: { workspace_id: workspaceId, created_at: { gte: recentWindow }, type: { in: ['task_created', 'task_assigned'] } },
+    }),
+    prisma.activities.count({
+      where: { workspace_id: workspaceId, created_at: { gte: recentWindow } },
+    }),
+    prisma.tasks.count({
+      where: { workspace_id: workspaceId, status: 'done', updated_at: { gte: hourAgo } },
+    }),
+  ])
 
-  const tasksLast5m = (db.prepare(
-    `SELECT COUNT(*) as c FROM activities WHERE workspace_id = ? AND created_at >= ? AND type IN ('task_created', 'task_assigned')`
-  ).get(workspaceId, recentWindow) as any).c;
-
-  const errorsLast5m = (db.prepare(
-    `SELECT COUNT(*) as c FROM activities WHERE workspace_id = ? AND created_at >= ? AND (type LIKE '%error%' OR type LIKE '%fail%')`
-  ).get(workspaceId, recentWindow) as any).c;
-
-  const totalLast5m = (db.prepare(
-    `SELECT COUNT(*) as c FROM activities WHERE workspace_id = ? AND created_at >= ?`
-  ).get(workspaceId, recentWindow) as any).c;
-
-  const completionsLastHour = (db.prepare(
-    `SELECT COUNT(*) as c FROM tasks WHERE workspace_id = ? AND status = 'done' AND updated_at >= ?`
-  ).get(workspaceId, hourAgo) as any).c;
+  const errorsLast5m = toNumber(
+    (
+      await prisma.$queryRaw<any[]>`
+        SELECT COUNT(*) as c
+        FROM activities
+        WHERE workspace_id = ${workspaceId}
+          AND created_at >= ${recentWindow}
+          AND (lower(type) LIKE '%error%' OR lower(type) LIKE '%fail%')
+      `
+    )[0]?.c
+  )
 
   // Average completion rate over last 24h
   const dayAgo = now - 86400;
-  const completionsLastDay = (db.prepare(
-    `SELECT COUNT(*) as c FROM tasks WHERE workspace_id = ? AND status = 'done' AND updated_at >= ?`
-  ).get(workspaceId, dayAgo) as any).c;
+  const completionsLastDay = await prisma.tasks.count({
+    where: { workspace_id: workspaceId, status: 'done', updated_at: { gte: dayAgo } },
+  })
 
   const safeErrorRate = totalLast5m > 0 ? errorsLast5m / totalLast5m : 0;
 
@@ -148,43 +165,54 @@ function buildCapacityMetrics(db: any, workspaceId: number, now: number): Capaci
   };
 }
 
-function buildQueueMetrics(db: any, workspaceId: number): QueueMetrics {
+async function buildQueueMetrics(prisma: ReturnType<typeof getPrismaClient>, workspaceId: number): Promise<QueueMetrics> {
   const now = Math.floor(Date.now() / 1000);
 
   const pendingStatuses = ['inbox', 'assigned', 'in_progress', 'review', 'quality_review'];
 
-  const byStatus = db.prepare(
-    `SELECT status, COUNT(*) as count FROM tasks WHERE workspace_id = ? AND status IN (${pendingStatuses.map(() => '?').join(',')}) GROUP BY status`
-  ).all(workspaceId, ...pendingStatuses) as Array<{ status: string; count: number }>;
+  const byStatusEntries = await Promise.all(
+    pendingStatuses.map(async (status) => ({
+      status,
+      count: await prisma.tasks.count({ where: { workspace_id: workspaceId, status } }),
+    }))
+  )
 
-  const byPriority = db.prepare(
-    `SELECT priority, COUNT(*) as count FROM tasks WHERE workspace_id = ? AND status IN (${pendingStatuses.map(() => '?').join(',')}) GROUP BY priority`
-  ).all(workspaceId, ...pendingStatuses) as Array<{ priority: string; count: number }>;
+  const priorities = ['critical', 'high', 'medium', 'low']
+  const byPriorityEntries = await Promise.all(
+    priorities.map(async (priority) => ({
+      priority,
+      count: await prisma.tasks.count({
+        where: { workspace_id: workspaceId, priority, status: { in: pendingStatuses } },
+      }),
+    }))
+  )
 
-  const totalPending = byStatus.reduce((sum, r) => sum + r.count, 0);
+  const totalPending = byStatusEntries.reduce((sum, r) => sum + r.count, 0);
 
-  const oldest = db.prepare(
-    `SELECT MIN(created_at) as oldest FROM tasks WHERE workspace_id = ? AND status IN ('inbox', 'assigned')`
-  ).get(workspaceId) as any;
+  const oldestAgg = await prisma.tasks.aggregate({
+    where: { workspace_id: workspaceId, status: { in: ['inbox', 'assigned'] } },
+    _min: { created_at: true },
+  })
 
-  const oldestAge = oldest?.oldest ? now - oldest.oldest : null;
+  const oldestCreatedAt = oldestAgg._min.created_at ?? null
+  const oldestAge = typeof oldestCreatedAt === 'number' ? now - oldestCreatedAt : null;
 
   // Estimate wait: pending tasks / completion rate per hour * 3600
   const hourAgo = now - 3600;
-  const completionsLastHour = (db.prepare(
-    `SELECT COUNT(*) as c FROM tasks WHERE workspace_id = ? AND status = 'done' AND updated_at >= ?`
-  ).get(workspaceId, hourAgo) as any).c;
+  const completionsLastHour = await prisma.tasks.count({
+    where: { workspace_id: workspaceId, status: 'done', updated_at: { gte: hourAgo } },
+  })
 
   const estimatedWait = completionsLastHour > 0
     ? Math.round((totalPending / completionsLastHour) * 3600)
     : null;
 
-  const statusMap = Object.fromEntries(byStatus.map(r => [r.status, r.count]));
+  const statusMap = Object.fromEntries(byStatusEntries.map(r => [r.status, r.count]));
   for (const status of pendingStatuses) {
     if (typeof statusMap[status] !== 'number') statusMap[status] = 0;
   }
 
-  const priorityMap = Object.fromEntries(byPriority.map(r => [r.priority, r.count]));
+  const priorityMap = Object.fromEntries(byPriorityEntries.map(r => [r.priority, r.count]));
   for (const priority of ['low', 'medium', 'high', 'critical', 'urgent']) {
     if (typeof priorityMap[priority] !== 'number') priorityMap[priority] = 0;
   }
@@ -199,16 +227,20 @@ function buildQueueMetrics(db: any, workspaceId: number): QueueMetrics {
   };
 }
 
-function buildAgentMetrics(db: any, workspaceId: number, now: number): AgentMetrics {
-  const agentStatuses = db.prepare(
-    `SELECT status, COUNT(*) as count FROM agents WHERE workspace_id = ? GROUP BY status`
-  ).all(workspaceId) as Array<{ status: string; count: number }>;
+async function buildAgentMetrics(prisma: ReturnType<typeof getPrismaClient>, workspaceId: number, now: number): Promise<AgentMetrics> {
+  const statuses = ['offline', 'idle', 'busy', 'error']
+  const statusCounts = await Promise.all(
+    statuses.map(async (status) => ({
+      status,
+      count: await prisma.agents.count({ where: { workspace_id: workspaceId, status } }),
+    }))
+  )
 
-  const statusMap: Record<string, number> = {};
-  let total = 0;
-  for (const row of agentStatuses) {
-    statusMap[row.status] = row.count;
-    total += row.count;
+  const statusMap: Record<string, number> = {}
+  let total = 0
+  for (const row of statusCounts) {
+    statusMap[row.status] = row.count
+    total += row.count
   }
 
   const online = (statusMap['idle'] || 0) + (statusMap['busy'] || 0);
@@ -217,16 +249,21 @@ function buildAgentMetrics(db: any, workspaceId: number, now: number): AgentMetr
   const offline = statusMap['offline'] || 0;
 
   // Load distribution per agent
-  const loadDist = db.prepare(`
+  const loadDistRaw = await prisma.$queryRaw<any[]>`
     SELECT a.name as agent,
       SUM(CASE WHEN t.status = 'assigned' THEN 1 ELSE 0 END) as assigned,
       SUM(CASE WHEN t.status = 'in_progress' THEN 1 ELSE 0 END) as in_progress
     FROM agents a
     LEFT JOIN tasks t ON t.assigned_to = a.name AND t.workspace_id = a.workspace_id AND t.status IN ('assigned', 'in_progress')
-    WHERE a.workspace_id = ? AND a.status != 'offline'
+    WHERE a.workspace_id = ${workspaceId} AND a.status != 'offline'
     GROUP BY a.name
-    ORDER BY (assigned + in_progress) DESC
-  `).all(workspaceId) as Array<{ agent: string; assigned: number; in_progress: number }>;
+    ORDER BY (SUM(CASE WHEN t.status = 'assigned' THEN 1 ELSE 0 END) + SUM(CASE WHEN t.status = 'in_progress' THEN 1 ELSE 0 END)) DESC
+  `
+  const loadDist = loadDistRaw.map((row) => ({
+    agent: String(row.agent),
+    assigned: toNumber(row.assigned),
+    in_progress: toNumber(row.in_progress),
+  }))
 
   return {
     total,

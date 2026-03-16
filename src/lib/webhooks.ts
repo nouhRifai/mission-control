@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from 'crypto'
 import { eventBus, type ServerEvent } from './event-bus'
 import { logger } from './logger'
+import { getPrismaClient } from './prisma'
 
 interface Webhook {
   id: number
@@ -132,12 +133,20 @@ async function fireWebhooksAsync(eventType: string, payload: Record<string, any>
     workspaceId ?? (typeof payload?.workspace_id === 'number' ? payload.workspace_id : 1)
   let webhooks: Webhook[]
   try {
-    // Lazy import to avoid circular dependency
-    const { getDatabase } = await import('./db')
-    const db = getDatabase()
-    webhooks = db.prepare(
-      'SELECT * FROM webhooks WHERE enabled = 1 AND workspace_id = ?'
-    ).all(resolvedWorkspaceId) as Webhook[]
+    const prisma = getPrismaClient()
+    webhooks = (await prisma.webhooks.findMany({
+      where: { enabled: 1, workspace_id: resolvedWorkspaceId },
+      select: {
+        id: true,
+        name: true,
+        url: true,
+        secret: true,
+        events: true,
+        enabled: true,
+        workspace_id: true,
+        consecutive_failures: true,
+      },
+    })) as unknown as Webhook[]
   } catch {
     return // DB not ready or table doesn't exist yet
   }
@@ -229,52 +238,68 @@ async function deliverWebhook(
 
   // Log delivery attempt and handle retry/circuit-breaker logic
   try {
-    const { getDatabase } = await import('./db')
-    const db = getDatabase()
+    const prisma = getPrismaClient()
+    const now = Math.floor(Date.now() / 1000)
+    const resolvedWorkspaceId = webhook.workspace_id ?? 1
 
-    const insertResult = db.prepare(`
-      INSERT INTO webhook_deliveries (webhook_id, event_type, payload, status_code, response_body, error, duration_ms, attempt, is_retry, parent_delivery_id, workspace_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      webhook.id,
-      eventType,
-      body,
-      statusCode,
-      responseBody,
-      error,
-      durationMs,
-      attempt,
-      attempt > 0 ? 1 : 0,
-      parentDeliveryId,
-      webhook.workspace_id ?? 1
-    )
-    deliveryId = Number(insertResult.lastInsertRowid)
+    const created = await prisma.webhook_deliveries.create({
+      data: {
+        webhook_id: webhook.id,
+        event_type: eventType,
+        payload: body,
+        status_code: statusCode,
+        response_body: responseBody,
+        error,
+        duration_ms: durationMs,
+        attempt,
+        is_retry: attempt > 0 ? 1 : 0,
+        parent_delivery_id: parentDeliveryId,
+        workspace_id: resolvedWorkspaceId,
+        created_at: now,
+      } as any,
+      select: { id: true },
+    })
+    deliveryId = created.id
 
-    // Update webhook last_fired
-    db.prepare(`
-      UPDATE webhooks SET last_fired_at = unixepoch(), last_status = ?, updated_at = unixepoch()
-      WHERE id = ? AND workspace_id = ?
-    `).run(statusCode ?? -1, webhook.id, webhook.workspace_id ?? 1)
+    await prisma.webhooks.updateMany({
+      where: { id: webhook.id, workspace_id: resolvedWorkspaceId },
+      data: { last_fired_at: now, last_status: statusCode ?? -1, updated_at: now },
+    })
 
     // Circuit breaker + retry scheduling (skip for test deliveries)
     if (allowRetry) {
       if (success) {
         // Reset consecutive failures on success
-        db.prepare(`UPDATE webhooks SET consecutive_failures = 0 WHERE id = ? AND workspace_id = ?`).run(webhook.id, webhook.workspace_id ?? 1)
+        await prisma.webhooks.updateMany({
+          where: { id: webhook.id, workspace_id: resolvedWorkspaceId },
+          data: { consecutive_failures: 0 },
+        })
       } else {
         // Increment consecutive failures
-        db.prepare(`UPDATE webhooks SET consecutive_failures = consecutive_failures + 1 WHERE id = ? AND workspace_id = ?`).run(webhook.id, webhook.workspace_id ?? 1)
+        await prisma.webhooks.updateMany({
+          where: { id: webhook.id, workspace_id: resolvedWorkspaceId },
+          data: { consecutive_failures: { increment: 1 } } as any,
+        })
 
         if (attempt < MAX_RETRIES - 1) {
           // Schedule retry
           const delaySec = nextRetryDelay(attempt)
           const nextRetryAt = Math.floor(Date.now() / 1000) + delaySec
-          db.prepare(`UPDATE webhook_deliveries SET next_retry_at = ? WHERE id = ?`).run(nextRetryAt, deliveryId)
+          await prisma.webhook_deliveries.updateMany({
+            where: { id: deliveryId, workspace_id: resolvedWorkspaceId },
+            data: { next_retry_at: nextRetryAt },
+          })
         } else {
           // Exhausted retries — trip circuit breaker
-          const wh = db.prepare(`SELECT consecutive_failures FROM webhooks WHERE id = ? AND workspace_id = ?`).get(webhook.id, webhook.workspace_id ?? 1) as { consecutive_failures: number } | undefined
-          if (wh && wh.consecutive_failures >= MAX_RETRIES) {
-            db.prepare(`UPDATE webhooks SET enabled = 0, updated_at = unixepoch() WHERE id = ? AND workspace_id = ?`).run(webhook.id, webhook.workspace_id ?? 1)
+          const wh = await prisma.webhooks.findFirst({
+            where: { id: webhook.id, workspace_id: resolvedWorkspaceId },
+            select: { consecutive_failures: true },
+          })
+          if (wh && (wh.consecutive_failures ?? 0) >= MAX_RETRIES) {
+            await prisma.webhooks.updateMany({
+              where: { id: webhook.id, workspace_id: resolvedWorkspaceId },
+              data: { enabled: 0, updated_at: now },
+            })
             logger.warn({ webhookId: webhook.id, name: webhook.name }, 'Webhook circuit breaker tripped — disabled after exhausting retries')
           }
         }
@@ -282,12 +307,18 @@ async function deliverWebhook(
     }
 
     // Prune old deliveries (keep last 200 per webhook)
-    db.prepare(`
-      DELETE FROM webhook_deliveries
-      WHERE webhook_id = ? AND workspace_id = ? AND id NOT IN (
-        SELECT id FROM webhook_deliveries WHERE webhook_id = ? AND workspace_id = ? ORDER BY created_at DESC LIMIT 200
-      )
-    `).run(webhook.id, webhook.workspace_id ?? 1, webhook.id, webhook.workspace_id ?? 1)
+    const keep = await prisma.webhook_deliveries.findMany({
+      where: { webhook_id: webhook.id, workspace_id: resolvedWorkspaceId },
+      orderBy: { created_at: 'desc' },
+      take: 200,
+      select: { id: true },
+    })
+    const keepIds = keep.map((row) => row.id)
+    if (keepIds.length > 0) {
+      await prisma.webhook_deliveries.deleteMany({
+        where: { webhook_id: webhook.id, workspace_id: resolvedWorkspaceId, id: { notIn: keepIds } },
+      })
+    }
   } catch (logErr) {
     logger.error({ err: logErr, webhookId: webhook.id }, 'Webhook delivery logging/pruning failed')
   }
@@ -301,55 +332,60 @@ async function deliverWebhook(
  */
 export async function processWebhookRetries(): Promise<{ ok: boolean; message: string }> {
   try {
-    const { getDatabase } = await import('./db')
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const now = Math.floor(Date.now() / 1000)
 
-    // Find deliveries ready for retry (limit batch to 50)
-    const pendingRetries = db.prepare(`
-      SELECT wd.id, wd.webhook_id, wd.event_type, wd.payload, wd.attempt,
-             w.id as w_id, w.name as w_name, w.url as w_url, w.secret as w_secret,
-             w.events as w_events, w.enabled as w_enabled, w.consecutive_failures as w_consecutive_failures,
-             wd.workspace_id as wd_workspace_id
-      FROM webhook_deliveries wd
-      JOIN webhooks w ON w.id = wd.webhook_id AND w.workspace_id = wd.workspace_id AND w.enabled = 1
-      WHERE wd.next_retry_at IS NOT NULL AND wd.next_retry_at <= ?
-      LIMIT 50
-    `).all(now) as Array<{
-      id: number; webhook_id: number; event_type: string; payload: string; attempt: number
-      w_id: number; w_name: string; w_url: string; w_secret: string | null
-      w_events: string; w_enabled: number; w_consecutive_failures: number; wd_workspace_id: number
-    }>
+    const pendingRetries = await prisma.webhook_deliveries.findMany({
+      where: { next_retry_at: { not: null, lte: now } } as any,
+      take: 50,
+      include: {
+        webhooks: {
+          select: {
+            id: true,
+            name: true,
+            url: true,
+            secret: true,
+            events: true,
+            enabled: true,
+            consecutive_failures: true,
+            workspace_id: true,
+          },
+        },
+      },
+    })
 
-    if (pendingRetries.length === 0) {
+    const eligible = pendingRetries.filter((row) => row.webhooks && (row.webhooks as any).enabled === 1)
+
+    if (eligible.length === 0) {
       return { ok: true, message: 'No pending retries' }
     }
 
     // Clear next_retry_at immediately to prevent double-processing
-    const clearStmt = db.prepare(`UPDATE webhook_deliveries SET next_retry_at = NULL WHERE id = ? AND workspace_id = ?`)
-    for (const row of pendingRetries) {
-      clearStmt.run(row.id, row.wd_workspace_id)
-    }
+    await prisma.webhook_deliveries.updateMany({
+      where: { id: { in: eligible.map((row) => row.id) } },
+      data: { next_retry_at: null },
+    })
 
     // Re-deliver each
     let succeeded = 0
     let failed = 0
-    for (const row of pendingRetries) {
+    for (const row of eligible) {
+      const wh = row.webhooks as any
       const webhook: Webhook = {
-        id: row.w_id,
-        name: row.w_name,
-        url: row.w_url,
-        secret: row.w_secret,
-        events: row.w_events,
-        enabled: row.w_enabled,
-        consecutive_failures: row.w_consecutive_failures,
-        workspace_id: row.wd_workspace_id,
+        id: wh.id,
+        name: wh.name,
+        url: wh.url,
+        secret: wh.secret,
+        events: wh.events,
+        enabled: wh.enabled,
+        consecutive_failures: wh.consecutive_failures,
+        workspace_id: row.workspace_id,
       }
 
       // Parse the original payload from the stored JSON body
       let parsedPayload: Record<string, any>
       try {
-        const parsed = JSON.parse(row.payload)
+        const parsed = JSON.parse(row.payload as any)
         parsedPayload = parsed.data ?? parsed
       } catch {
         parsedPayload = {}
@@ -365,7 +401,7 @@ export async function processWebhookRetries(): Promise<{ ok: boolean; message: s
       else failed++
     }
 
-    return { ok: true, message: `Processed ${pendingRetries.length} retries (${succeeded} ok, ${failed} failed)` }
+    return { ok: true, message: `Processed ${eligible.length} retries (${succeeded} ok, ${failed} failed)` }
   } catch (err: any) {
     return { ok: false, message: `Webhook retry failed: ${err.message}` }
   }

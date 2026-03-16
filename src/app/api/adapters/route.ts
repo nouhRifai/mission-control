@@ -8,7 +8,7 @@ import { logger } from '@/lib/logger'
  * GET /api/adapters — List available framework adapters.
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   return NextResponse.json({ adapters: listAdapters() })
@@ -27,7 +27,7 @@ export async function GET(request: NextRequest) {
  *   disconnect — Disconnect an agent
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateLimited = agentHeartbeatLimiter(request)

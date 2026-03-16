@@ -5,7 +5,7 @@
  * to produce actionable recommendations for reducing agent cost and latency.
  */
 
-import { getDatabase } from '@/lib/db'
+import { getPrismaClient } from '@/lib/prisma'
 
 export interface TokenEfficiency {
   agentName: string
@@ -43,27 +43,31 @@ export interface Recommendation {
   metric?: number
 }
 
-export function analyzeTokenEfficiency(
+export async function analyzeTokenEfficiency(
   agentName: string,
   hours: number = 24,
   workspaceId: number = 1,
-): TokenEfficiency {
-  const db = getDatabase()
+): Promise<TokenEfficiency> {
+  const prisma = getPrismaClient()
   const since = Math.floor(Date.now() / 1000) - hours * 3600
 
-  const row = db.prepare(`
-    SELECT
-      COUNT(*) as sessions,
-      COALESCE(SUM(input_tokens), 0) as input_tokens,
-      COALESCE(SUM(output_tokens), 0) as output_tokens,
-      COALESCE(SUM(cost_usd), 0) as total_cost
-    FROM token_usage
-    WHERE agent_name = ? AND created_at > ?
-  `).get(agentName, since) as any
+  // Note: keep behavior aligned with the legacy SQL (no workspace_id filter here).
+  const where = { agent_name: agentName, created_at: { gt: since } } as const
 
-  const sessions = row?.sessions ?? 0
-  const inputTokens = row?.input_tokens ?? 0
-  const outputTokens = row?.output_tokens ?? 0
+  const [sessions, sums] = await Promise.all([
+    prisma.token_usage.count({ where }),
+    prisma.token_usage.aggregate({
+      where,
+      _sum: {
+        input_tokens: true,
+        output_tokens: true,
+        cost_usd: true,
+      },
+    }),
+  ])
+
+  const inputTokens = sums._sum.input_tokens ?? 0
+  const outputTokens = sums._sum.output_tokens ?? 0
   const totalTokens = inputTokens + outputTokens
 
   return {
@@ -71,122 +75,158 @@ export function analyzeTokenEfficiency(
     totalInputTokens: inputTokens,
     totalOutputTokens: outputTokens,
     totalTokens,
-    totalCostUsd: Math.round((row?.total_cost ?? 0) * 10000) / 10000,
+    totalCostUsd: Math.round(((sums._sum.cost_usd ?? 0) as number) * 10000) / 10000,
     sessionsCount: sessions,
     avgTokensPerSession: sessions > 0 ? Math.round(totalTokens / sessions) : 0,
-    avgCostPerSession: sessions > 0 ? Math.round((row?.total_cost ?? 0) / sessions * 10000) / 10000 : 0,
+    avgCostPerSession: sessions > 0
+      ? Math.round((((sums._sum.cost_usd ?? 0) as number) / sessions) * 10000) / 10000
+      : 0,
   }
 }
 
-export function analyzeToolPatterns(
+export async function analyzeToolPatterns(
   agentName: string,
   hours: number = 24,
   workspaceId: number = 1,
-): ToolPatterns {
-  const db = getDatabase()
+): Promise<ToolPatterns> {
+  const prisma = getPrismaClient()
   const since = Math.floor(Date.now() / 1000) - hours * 3600
 
-  const totals = db.prepare(`
-    SELECT
-      COUNT(*) as total,
-      COUNT(DISTINCT tool_name) as unique_tools,
-      SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) as failures,
-      AVG(duration_ms) as avg_duration
-    FROM mcp_call_log
-    WHERE agent_name = ? AND workspace_id = ? AND created_at > ?
-  `).get(agentName, workspaceId, since) as any
+  const where = {
+    agent_name: agentName,
+    workspace_id: workspaceId,
+    created_at: { gt: since },
+  } as const
 
-  const topTools = db.prepare(`
-    SELECT
-      tool_name,
-      COUNT(*) as count,
-      SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) as success_rate
-    FROM mcp_call_log
-    WHERE agent_name = ? AND workspace_id = ? AND created_at > ?
-    GROUP BY tool_name
-    ORDER BY count DESC
-    LIMIT 10
-  `).all(agentName, workspaceId, since) as any[]
-
-  const total = totals?.total ?? 0
+  const [total, failures, avgDuration, uniqueToolRows, topTools] = await Promise.all([
+    prisma.mcp_call_log.count({ where }),
+    prisma.mcp_call_log.count({ where: { ...where, success: 0 } }),
+    prisma.mcp_call_log.aggregate({ where, _avg: { duration_ms: true } }),
+    prisma.mcp_call_log.findMany({
+      where: { ...where, tool_name: { not: null } },
+      distinct: ['tool_name'],
+      select: { tool_name: true },
+    }),
+    prisma.mcp_call_log.groupBy({
+      by: ['tool_name'],
+      where,
+      _count: { id: true },
+      _sum: { success: true },
+      orderBy: { _count: { id: 'desc' } },
+      take: 10,
+    }),
+  ])
 
   return {
     agentName,
     totalCalls: total,
-    uniqueTools: totals?.unique_tools ?? 0,
-    topTools: topTools.map((t: any) => ({
-      toolName: t.tool_name ?? 'unknown',
-      count: t.count,
-      successRate: Math.round(t.success_rate * 100) / 100,
-    })),
-    failureRate: total > 0 ? Math.round(((totals?.failures ?? 0) / total) * 10000) / 100 : 0,
-    avgDurationMs: Math.round(totals?.avg_duration ?? 0),
+    uniqueTools: uniqueToolRows.length,
+    topTools: topTools.map((t: any) => {
+      const count = t._count?.id ?? 0
+      const successes = t._sum?.success ?? 0
+      const successRate = count > 0 ? (successes / count) * 100 : 0
+      return {
+        toolName: t.tool_name ?? 'unknown',
+        count,
+        successRate: Math.round(successRate * 100) / 100,
+      }
+    }),
+    failureRate: total > 0 ? Math.round((failures / total) * 10000) / 100 : 0,
+    avgDurationMs: Math.round(avgDuration._avg.duration_ms ?? 0),
   }
 }
 
-export function getFleetBenchmarks(workspaceId: number = 1): FleetBenchmark[] {
-  const db = getDatabase()
+export async function getFleetBenchmarks(workspaceId: number = 1): Promise<FleetBenchmark[]> {
+  const prisma = getPrismaClient()
 
-  const rows = db.prepare(`
-    SELECT
-      a.agent_name,
-      COALESCE(t.tokens_per_task, 0) as tokens_per_task,
-      COALESCE(t.cost_per_task, 0) as cost_per_task,
-      COALESCE(t.tasks_completed, 0) as tasks_completed,
-      COALESCE(ats.trust_score, 1.0) as trust_score,
-      COALESCE(m.tool_calls_per_task, 0) as tool_calls_per_task
-    FROM (SELECT DISTINCT agent_name FROM agent_trust_scores WHERE workspace_id = ?) a
-    LEFT JOIN (
-      SELECT
-        agent_name,
-        CASE WHEN COUNT(DISTINCT task_id) > 0
-          THEN SUM(input_tokens + output_tokens) * 1.0 / COUNT(DISTINCT task_id)
-          ELSE 0
-        END as tokens_per_task,
-        CASE WHEN COUNT(DISTINCT task_id) > 0
-          THEN SUM(COALESCE(cost_usd, 0)) * 1.0 / COUNT(DISTINCT task_id)
-          ELSE 0
-        END as cost_per_task,
-        COUNT(DISTINCT task_id) as tasks_completed
-      FROM token_usage
-      WHERE task_id IS NOT NULL
-      GROUP BY agent_name
-    ) t ON t.agent_name = a.agent_name
-    LEFT JOIN agent_trust_scores ats ON ats.agent_name = a.agent_name AND ats.workspace_id = ?
-    LEFT JOIN (
-      SELECT
-        agent_name,
-        COUNT(*) * 1.0 / NULLIF(
-          (SELECT COUNT(DISTINCT task_id) FROM token_usage tu2 WHERE tu2.agent_name = mcl.agent_name AND tu2.task_id IS NOT NULL),
-          0
-        ) as tool_calls_per_task
-      FROM mcp_call_log mcl
-      WHERE workspace_id = ?
-      GROUP BY agent_name
-    ) m ON m.agent_name = a.agent_name
-  `).all(workspaceId, workspaceId, workspaceId) as any[]
+  const [agents, trusts, tokenSums, distinctTasks, toolCalls] = await Promise.all([
+    prisma.agent_trust_scores.findMany({
+      where: { workspace_id: workspaceId },
+      select: { agent_name: true },
+    }),
+    prisma.agent_trust_scores.findMany({
+      where: { workspace_id: workspaceId },
+      select: { agent_name: true, trust_score: true },
+    }),
+    // Legacy behavior: token_usage is not workspace-scoped here.
+    prisma.token_usage.groupBy({
+      by: ['agent_name'],
+      where: { task_id: { not: null }, agent_name: { not: null } },
+      _sum: { input_tokens: true, output_tokens: true, cost_usd: true },
+    }),
+    prisma.token_usage.groupBy({
+      by: ['agent_name', 'task_id'],
+      where: { task_id: { not: null }, agent_name: { not: null } },
+      _count: { _all: true },
+    }),
+    prisma.mcp_call_log.groupBy({
+      by: ['agent_name'],
+      where: { workspace_id: workspaceId, agent_name: { not: null } },
+      _count: { _all: true },
+    }),
+  ])
 
-  return rows.map((r: any) => ({
-    agentName: r.agent_name,
-    tokensPerTask: Math.round(r.tokens_per_task),
-    costPerTask: Math.round(r.cost_per_task * 10000) / 10000,
-    tasksCompleted: r.tasks_completed,
-    trustScore: Math.round(r.trust_score * 100) / 100,
-    toolCallsPerTask: Math.round(r.tool_calls_per_task * 10) / 10,
-  }))
+  const trustByAgent = new Map(trusts.map(t => [t.agent_name, t.trust_score]))
+
+  const tokenByAgent = new Map(
+    tokenSums.map((t: any) => [
+      t.agent_name,
+      {
+        input: t._sum?.input_tokens ?? 0,
+        output: t._sum?.output_tokens ?? 0,
+        cost: t._sum?.cost_usd ?? 0,
+      },
+    ])
+  )
+
+  const tasksCompletedByAgent = new Map<string, number>()
+  for (const row of distinctTasks as any[]) {
+    const name = row.agent_name as string
+    tasksCompletedByAgent.set(name, (tasksCompletedByAgent.get(name) ?? 0) + 1)
+  }
+
+  const toolCallsByAgent = new Map<string, number>()
+  for (const row of toolCalls as any[]) {
+    toolCallsByAgent.set(row.agent_name as string, row._count?._all ?? 0)
+  }
+
+  // agent_trust_scores is unique on (agent_name, workspace_id), so this list is already distinct.
+  const agentNames = agents.map(a => a.agent_name)
+
+  return agentNames.map((agentName) => {
+    const sums = tokenByAgent.get(agentName) ?? { input: 0, output: 0, cost: 0 }
+    const tasksCompleted = tasksCompletedByAgent.get(agentName) ?? 0
+    const totalTokens = (sums.input ?? 0) + (sums.output ?? 0)
+    const cost = sums.cost ?? 0
+    const trustScore = trustByAgent.get(agentName) ?? 1.0
+    const toolCallsCount = toolCallsByAgent.get(agentName) ?? 0
+
+    const tokensPerTask = tasksCompleted > 0 ? totalTokens / tasksCompleted : 0
+    const costPerTask = tasksCompleted > 0 ? cost / tasksCompleted : 0
+    const toolCallsPerTask = tasksCompleted > 0 ? toolCallsCount / tasksCompleted : 0
+
+    return {
+      agentName,
+      tokensPerTask: Math.round(tokensPerTask),
+      costPerTask: Math.round(costPerTask * 10000) / 10000,
+      tasksCompleted,
+      trustScore: Math.round(trustScore * 100) / 100,
+      toolCallsPerTask: Math.round(toolCallsPerTask * 10) / 10,
+    }
+  })
 }
 
-export function generateRecommendations(
+export async function generateRecommendations(
   agentName: string,
   workspaceId: number = 1,
-): Recommendation[] {
+): Promise<Recommendation[]> {
+  const prisma = getPrismaClient()
   const recommendations: Recommendation[] = []
-  const db = getDatabase()
 
   // Check trust score
-  const trust = db.prepare(`
-    SELECT * FROM agent_trust_scores WHERE agent_name = ? AND workspace_id = ?
-  `).get(agentName, workspaceId) as any
+  const trust = await prisma.agent_trust_scores.findFirst({
+    where: { agent_name: agentName, workspace_id: workspaceId },
+  })
 
   if (trust) {
     if (trust.trust_score < 0.5) {
@@ -216,16 +256,15 @@ export function generateRecommendations(
   }
 
   // Check tool failure rate
-  const toolStats = db.prepare(`
-    SELECT
-      COUNT(*) as total,
-      SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) as failures
-    FROM mcp_call_log
-    WHERE agent_name = ? AND workspace_id = ? AND created_at > ?
-  `).get(agentName, workspaceId, Math.floor(Date.now() / 1000) - 86400) as any
+  const since = Math.floor(Date.now() / 1000) - 86400
+  const toolWhere = { agent_name: agentName, workspace_id: workspaceId, created_at: { gt: since } } as const
+  const [toolTotal, toolFailures] = await Promise.all([
+    prisma.mcp_call_log.count({ where: toolWhere }),
+    prisma.mcp_call_log.count({ where: { ...toolWhere, success: 0 } }),
+  ])
 
-  if (toolStats && toolStats.total > 10) {
-    const failRate = toolStats.failures / toolStats.total
+  if (toolTotal > 10) {
+    const failRate = toolFailures / toolTotal
     if (failRate > 0.3) {
       recommendations.push({
         category: 'reliability',
@@ -237,28 +276,59 @@ export function generateRecommendations(
   }
 
   // Check token efficiency vs fleet average
-  const agentCost = db.prepare(`
-    SELECT COALESCE(SUM(cost_usd), 0) as cost, COUNT(DISTINCT task_id) as tasks
-    FROM token_usage
-    WHERE agent_name = ? AND task_id IS NOT NULL
-  `).get(agentName) as any
+  // Legacy behavior: token_usage is not workspace-scoped here.
+  const [agentCostAgg, agentTaskIds, fleetCostAgg, fleetTaskPairs] = await Promise.all([
+    prisma.token_usage.aggregate({
+      where: { agent_name: agentName, task_id: { not: null } },
+      _sum: { cost_usd: true },
+    }),
+    prisma.token_usage.findMany({
+      where: { agent_name: agentName, task_id: { not: null } },
+      distinct: ['task_id'],
+      select: { task_id: true },
+    }),
+    prisma.token_usage.groupBy({
+      by: ['agent_name'],
+      where: { agent_name: { not: null }, task_id: { not: null } },
+      _sum: { cost_usd: true },
+    }),
+    prisma.token_usage.groupBy({
+      by: ['agent_name', 'task_id'],
+      where: { agent_name: { not: null }, task_id: { not: null } },
+      _count: { _all: true },
+    }),
+  ])
 
-  const fleetAvg = db.prepare(`
-    SELECT AVG(cost_per_task) as avg_cost FROM (
-      SELECT SUM(COALESCE(cost_usd, 0)) * 1.0 / NULLIF(COUNT(DISTINCT task_id), 0) as cost_per_task
-      FROM token_usage
-      WHERE agent_name IS NOT NULL AND task_id IS NOT NULL
-      GROUP BY agent_name
-    )
-  `).get() as any
+  const agentTasks = agentTaskIds.length
+  const agentCost = (agentCostAgg._sum.cost_usd ?? 0) as number
 
-  if (agentCost?.tasks > 0 && fleetAvg?.avg_cost > 0) {
-    const agentCostPerTask = agentCost.cost / agentCost.tasks
-    if (agentCostPerTask > fleetAvg.avg_cost * 2) {
+  const tasksByAgent = new Map<string, number>()
+  for (const row of fleetTaskPairs as any[]) {
+    const name = row.agent_name as string
+    tasksByAgent.set(name, (tasksByAgent.get(name) ?? 0) + 1)
+  }
+
+  let sumCostPerTask = 0
+  let agentsWithTasks = 0
+  for (const row of fleetCostAgg as any[]) {
+    const name = row.agent_name as string
+    const cost = (row._sum?.cost_usd ?? 0) as number
+    const tasks = tasksByAgent.get(name) ?? 0
+    if (tasks > 0) {
+      sumCostPerTask += cost / tasks
+      agentsWithTasks += 1
+    }
+  }
+
+  const fleetAvgCost = agentsWithTasks > 0 ? sumCostPerTask / agentsWithTasks : 0
+
+  if (agentTasks > 0 && fleetAvgCost > 0) {
+    const agentCostPerTask = agentCost / agentTasks
+    if (agentCostPerTask > fleetAvgCost * 2) {
       recommendations.push({
         category: 'cost',
         severity: 'warning',
-        message: `Cost per task ($${agentCostPerTask.toFixed(4)}) is ${(agentCostPerTask / fleetAvg.avg_cost).toFixed(1)}x the fleet average.`,
+        message: `Cost per task ($${agentCostPerTask.toFixed(4)}) is ${(agentCostPerTask / fleetAvgCost).toFixed(1)}x the fleet average.`,
         metric: agentCostPerTask,
       })
     }

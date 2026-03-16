@@ -1,18 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getDatabase } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { deliverWebhookPublic } from '@/lib/webhooks'
 import { logger } from '@/lib/logger'
+import { getPrismaClient } from '@/lib/prisma'
 
 /**
  * POST /api/webhooks/retry - Manually retry a failed delivery
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const workspaceId = auth.user.workspace_id ?? 1
     const { delivery_id } = await request.json()
 
@@ -20,32 +20,29 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'delivery_id is required' }, { status: 400 })
     }
 
-    const delivery = db.prepare(`
-      SELECT wd.*, w.id as w_id, w.name as w_name, w.url as w_url, w.secret as w_secret,
-             w.events as w_events, w.enabled as w_enabled, w.workspace_id as w_workspace_id
-      FROM webhook_deliveries wd
-      JOIN webhooks w ON w.id = wd.webhook_id AND w.workspace_id = wd.workspace_id
-      WHERE wd.id = ? AND wd.workspace_id = ?
-    `).get(delivery_id, workspaceId) as any
+    const delivery = await prisma.webhook_deliveries.findFirst({
+      where: { id: Number(delivery_id), workspace_id: workspaceId },
+      include: { webhooks: true },
+    })
 
-    if (!delivery) {
+    if (!delivery || !delivery.webhooks) {
       return NextResponse.json({ error: 'Delivery not found' }, { status: 404 })
     }
 
     const webhook = {
-      id: delivery.w_id,
-      name: delivery.w_name,
-      url: delivery.w_url,
-      secret: delivery.w_secret,
-      events: delivery.w_events,
-      enabled: delivery.w_enabled,
-      workspace_id: delivery.w_workspace_id,
+      id: delivery.webhooks.id,
+      name: delivery.webhooks.name,
+      url: delivery.webhooks.url,
+      secret: delivery.webhooks.secret,
+      events: delivery.webhooks.events,
+      enabled: delivery.webhooks.enabled,
+      workspace_id: delivery.webhooks.workspace_id,
     }
 
     // Parse the original payload
     let parsedPayload: Record<string, any>
     try {
-      const parsed = JSON.parse(delivery.payload)
+      const parsed = JSON.parse(delivery.payload as any)
       parsedPayload = parsed.data ?? parsed
     } catch {
       parsedPayload = {}
@@ -53,7 +50,7 @@ export async function POST(request: NextRequest) {
 
     const result = await deliverWebhookPublic(webhook, delivery.event_type, parsedPayload, {
       attempt: (delivery.attempt ?? 0) + 1,
-      parentDeliveryId: delivery.id,
+      parentDeliveryId: delivery.id as any,
       allowRetry: false, // Manual retries don't auto-schedule further retries
     })
 

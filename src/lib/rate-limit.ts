@@ -66,7 +66,7 @@ export function createRateLimiter(options: RateLimiterOptions) {
 
     entry.count++
     if (entry.count > options.maxRequests) {
-      try { logSecurityEvent({ event_type: 'rate_limit_hit', severity: 'warning', source: 'rate-limiter', detail: JSON.stringify({ ip }), ip_address: ip, workspace_id: 1, tenant_id: 1 }) } catch {}
+      void logSecurityEvent({ event_type: 'rate_limit_hit', severity: 'warning', source: 'rate-limiter', detail: JSON.stringify({ ip }), ip_address: ip, workspace_id: 1, tenant_id: 1 }).catch(() => {})
       return NextResponse.json(
         { error: options.message || 'Too many requests. Please try again later.' },
         { status: 429 }
@@ -137,7 +137,7 @@ export function createAgentRateLimiter(options: RateLimiterOptions) {
 
     entry.count++
     if (entry.count > options.maxRequests) {
-      try { logSecurityEvent({ event_type: 'rate_limit_hit', severity: 'warning', source: 'rate-limiter', agent_name: agentName || undefined, detail: JSON.stringify({ ip: key }), ip_address: typeof key === 'string' ? key : 'unknown', workspace_id: 1, tenant_id: 1 }) } catch {}
+      void logSecurityEvent({ event_type: 'rate_limit_hit', severity: 'warning', source: 'rate-limiter', agent_name: agentName || undefined, detail: JSON.stringify({ ip: key }), ip_address: typeof key === 'string' ? key : 'unknown', workspace_id: 1, tenant_id: 1 }).catch(() => {})
       const who = agentName ? `Agent "${agentName}"` : 'Client'
       return NextResponse.json(
         { error: options.message || `${who} has exceeded the rate limit. Please try again later.` },

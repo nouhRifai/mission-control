@@ -31,7 +31,7 @@ function computeHash(raw: string): string {
  * GET /api/gateway-config?action=schema - Get the config JSON schema
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const action = request.nextUrl.searchParams.get('action')
@@ -102,7 +102,7 @@ async function getSchema(): Promise<NextResponse> {
  * Body: { updates: { "path.to.key": value, ... }, hash?: string }
  */
 export async function PUT(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = mutationLimiter(request)

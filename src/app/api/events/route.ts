@@ -10,7 +10,7 @@ export const runtime = 'nodejs'
  * Clients connect via EventSource and receive JSON-encoded events.
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const encoder = new TextEncoder()

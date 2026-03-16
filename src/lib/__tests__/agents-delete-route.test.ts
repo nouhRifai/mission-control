@@ -4,7 +4,8 @@ import { NextRequest } from 'next/server'
 const requireRole = vi.fn()
 const runOpenClaw = vi.fn()
 const removeAgentFromConfig = vi.fn()
-const prepare = vi.fn()
+const prismaAgentsFindFirst = vi.fn()
+const prismaAgentsDeleteMany = vi.fn()
 
 vi.mock('@/lib/auth', () => ({
   requireRole,
@@ -21,11 +22,19 @@ vi.mock('@/lib/agent-sync', () => ({
 }))
 
 vi.mock('@/lib/db', () => ({
-  getDatabase: vi.fn(() => ({ prepare })),
   db_helpers: {
     logActivity: vi.fn(),
   },
   logAuditEvent: vi.fn(),
+}))
+
+vi.mock('@/lib/prisma', () => ({
+  getPrismaClient: vi.fn(() => ({
+    agents: {
+      findFirst: prismaAgentsFindFirst,
+      deleteMany: prismaAgentsDeleteMany,
+    },
+  })),
 }))
 
 vi.mock('@/lib/event-bus', () => ({
@@ -48,7 +57,8 @@ describe('DELETE /api/agents/[id]', () => {
     requireRole.mockReturnValue({ user: { id: 1, username: 'admin', role: 'admin', workspace_id: 1 } })
     runOpenClaw.mockReset()
     removeAgentFromConfig.mockReset()
-    prepare.mockReset()
+    prismaAgentsFindFirst.mockReset()
+    prismaAgentsDeleteMany.mockReset()
   })
 
   afterEach(() => {
@@ -57,13 +67,8 @@ describe('DELETE /api/agents/[id]', () => {
 
   it('removes the agent from OpenClaw config even when workspace deletion is disabled', async () => {
     const agent = { id: 7, name: 'neo', role: 'tester', config: JSON.stringify({ openclawId: 'neo' }) }
-    const selectStmt = { get: vi.fn(() => agent) }
-    const deleteStmt = { run: vi.fn() }
-    prepare.mockImplementation((sql: string) => {
-      if (sql.startsWith('SELECT * FROM agents')) return selectStmt
-      if (sql.startsWith('DELETE FROM agents')) return deleteStmt
-      throw new Error(`Unexpected SQL: ${sql}`)
-    })
+    prismaAgentsFindFirst.mockResolvedValue(agent)
+    prismaAgentsDeleteMany.mockResolvedValue({ count: 1 })
 
     const { DELETE } = await import('@/app/api/agents/[id]/route')
     const request = new NextRequest('http://localhost/api/agents/7', {
@@ -78,19 +83,14 @@ describe('DELETE /api/agents/[id]', () => {
     expect(response.status).toBe(200)
     expect(runOpenClaw).not.toHaveBeenCalled()
     expect(removeAgentFromConfig).toHaveBeenCalledWith({ id: 'neo', name: 'neo' })
-    expect(deleteStmt.run).toHaveBeenCalledWith(7, 1)
+    expect(prismaAgentsDeleteMany).toHaveBeenCalledWith({ where: { id: 7, workspace_id: 1 } })
     expect(body.success).toBe(true)
   })
 
   it('removes workspace via OpenClaw and then removes the config entry', async () => {
     const agent = { id: 8, name: 'adam', role: 'tester', config: JSON.stringify({ openclawId: 'adam' }) }
-    const selectStmt = { get: vi.fn(() => agent) }
-    const deleteStmt = { run: vi.fn() }
-    prepare.mockImplementation((sql: string) => {
-      if (sql.startsWith('SELECT * FROM agents')) return selectStmt
-      if (sql.startsWith('DELETE FROM agents')) return deleteStmt
-      throw new Error(`Unexpected SQL: ${sql}`)
-    })
+    prismaAgentsFindFirst.mockResolvedValue(agent)
+    prismaAgentsDeleteMany.mockResolvedValue({ count: 1 })
 
     const { DELETE } = await import('@/app/api/agents/[id]/route')
     const request = new NextRequest('http://localhost/api/agents/8', {
@@ -104,18 +104,13 @@ describe('DELETE /api/agents/[id]', () => {
     expect(response.status).toBe(200)
     expect(runOpenClaw).toHaveBeenCalledWith(['agents', 'delete', 'adam', '--force'], { timeoutMs: 30000 })
     expect(removeAgentFromConfig).toHaveBeenCalledWith({ id: 'adam', name: 'adam' })
-    expect(deleteStmt.run).toHaveBeenCalledWith(8, 1)
+    expect(prismaAgentsDeleteMany).toHaveBeenCalledWith({ where: { id: 8, workspace_id: 1 } })
   })
 
   it('still deletes the Mission Control agent when config cleanup fails', async () => {
     const agent = { id: 9, name: 'trinity', role: 'tester', config: JSON.stringify({ openclawId: 'trinity' }) }
-    const selectStmt = { get: vi.fn(() => agent) }
-    const deleteStmt = { run: vi.fn() }
-    prepare.mockImplementation((sql: string) => {
-      if (sql.startsWith('SELECT * FROM agents')) return selectStmt
-      if (sql.startsWith('DELETE FROM agents')) return deleteStmt
-      throw new Error(`Unexpected SQL: ${sql}`)
-    })
+    prismaAgentsFindFirst.mockResolvedValue(agent)
+    prismaAgentsDeleteMany.mockResolvedValue({ count: 1 })
     removeAgentFromConfig.mockRejectedValue(new Error('OPENCLAW_CONFIG_PATH not configured'))
 
     const { DELETE } = await import('@/app/api/agents/[id]/route')
@@ -128,7 +123,7 @@ describe('DELETE /api/agents/[id]', () => {
     const body = await response.json()
 
     expect(response.status).toBe(200)
-    expect(deleteStmt.run).toHaveBeenCalledWith(9, 1)
+    expect(prismaAgentsDeleteMany).toHaveBeenCalledWith({ where: { id: 9, workspace_id: 1 } })
     expect(body.success).toBe(true)
     expect(body.warning).toContain('OpenClaw config cleanup skipped')
   })

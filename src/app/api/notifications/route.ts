@@ -1,20 +1,21 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDatabase, Notification } from '@/lib/db';
+import { Notification } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
 import { mutationLimiter } from '@/lib/rate-limit';
 import { validateBody, notificationActionSchema } from '@/lib/validation';
 import { logger } from '@/lib/logger';
+import { getPrismaClient } from '@/lib/prisma';
 
 /**
  * GET /api/notifications - Get notifications for a specific recipient
  * Query params: recipient, unread_only, type, limit, offset
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const { searchParams } = new URL(request.url);
     const workspaceId = auth.user.workspace_id ?? 1;
     
@@ -29,104 +30,101 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Recipient is required' }, { status: 400 });
     }
     
-    // Build dynamic query
-    let query = 'SELECT * FROM notifications WHERE recipient = ? AND workspace_id = ?';
-    const params: any[] = [recipient, workspaceId];
-    
-    if (unread_only) {
-      query += ' AND read_at IS NULL';
+    const where: any = {
+      recipient,
+      workspace_id: workspaceId,
     }
-    
-    if (type) {
-      query += ' AND type = ?';
-      params.push(type);
+    if (unread_only) where.read_at = null
+    if (type) where.type = type
+
+    const notifications = await prisma.notifications.findMany({
+      where,
+      orderBy: { created_at: 'desc' },
+      take: limit,
+      skip: offset,
+    }) as unknown as Notification[]
+
+    // Enhance notifications with related entity data without N+1 queries.
+    const taskIds = new Set<number>()
+    const commentIds = new Set<number>()
+    const agentIds = new Set<number>()
+    for (const n of notifications) {
+      if (!n.source_type || !n.source_id) continue
+      if (n.source_type === 'task') taskIds.add(n.source_id)
+      else if (n.source_type === 'comment') commentIds.add(n.source_id)
+      else if (n.source_type === 'agent') agentIds.add(n.source_id)
     }
-    
-    query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
-    params.push(limit, offset);
-    
-    const stmt = db.prepare(query);
-    const notifications = stmt.all(...params) as Notification[];
-    
-    // Prepare source detail statements once (avoids N+1)
-    const taskDetailStmt = db.prepare('SELECT id, title, status FROM tasks WHERE id = ? AND workspace_id = ?');
-    const commentDetailStmt = db.prepare(`
-      SELECT c.id, c.content, c.task_id, t.title as task_title
-      FROM comments c
-      LEFT JOIN tasks t ON c.task_id = t.id
-      WHERE c.id = ? AND c.workspace_id = ? AND t.workspace_id = ?
-    `);
-    const agentDetailStmt = db.prepare('SELECT id, name, role, status FROM agents WHERE id = ? AND workspace_id = ?');
 
-    // Enhance notifications with related entity data
-    const enhancedNotifications = notifications.map(notification => {
-      let sourceDetails = null;
+    const [tasks, comments, agents] = await Promise.all([
+      taskIds.size
+        ? prisma.tasks.findMany({
+            where: { id: { in: [...taskIds] }, workspace_id: workspaceId },
+            select: { id: true, title: true, status: true },
+          })
+        : Promise.resolve([]),
+      commentIds.size
+        ? prisma.comments.findMany({
+            where: { id: { in: [...commentIds] }, workspace_id: workspaceId, tasks: { workspace_id: workspaceId } },
+            select: { id: true, content: true, task_id: true, tasks: { select: { title: true } } },
+          })
+        : Promise.resolve([]),
+      agentIds.size
+        ? prisma.agents.findMany({
+            where: { id: { in: [...agentIds] }, workspace_id: workspaceId },
+            select: { id: true, name: true, role: true, status: true },
+          })
+        : Promise.resolve([]),
+    ])
 
+    const taskMap = new Map(tasks.map((t) => [t.id, t]))
+    const commentMap = new Map(comments.map((c: any) => [c.id, c]))
+    const agentMap = new Map(agents.map((a) => [a.id, a]))
+
+    const enhancedNotifications = notifications.map((notification) => {
+      let sourceDetails: any = null
       try {
         if (notification.source_type && notification.source_id) {
-          switch (notification.source_type) {
-            case 'task': {
-              const task = taskDetailStmt.get(notification.source_id, workspaceId) as any;
-              if (task) {
-                sourceDetails = { type: 'task', ...task };
+          if (notification.source_type === 'task') {
+            const task = taskMap.get(notification.source_id)
+            if (task) sourceDetails = { type: 'task', ...task }
+          } else if (notification.source_type === 'comment') {
+            const comment = commentMap.get(notification.source_id)
+            if (comment) {
+              sourceDetails = {
+                type: 'comment',
+                id: comment.id,
+                content: comment.content,
+                task_id: comment.task_id,
+                task_title: comment.tasks?.title ?? null,
+                content_preview: comment.content?.substring(0, 100) || '',
               }
-              break;
             }
-            case 'comment': {
-              const comment = commentDetailStmt.get(notification.source_id, workspaceId, workspaceId) as any;
-              if (comment) {
-                sourceDetails = {
-                  type: 'comment',
-                  ...comment,
-                  content_preview: comment.content?.substring(0, 100) || ''
-                };
-              }
-              break;
-            }
-            case 'agent': {
-              const agent = agentDetailStmt.get(notification.source_id, workspaceId) as any;
-              if (agent) {
-                sourceDetails = { type: 'agent', ...agent };
-              }
-              break;
-            }
+          } else if (notification.source_type === 'agent') {
+            const agent = agentMap.get(notification.source_id)
+            if (agent) sourceDetails = { type: 'agent', ...agent }
           }
         }
       } catch (error) {
-        logger.warn({ err: error, notificationId: notification.id }, 'Failed to fetch source details for notification');
+        logger.warn({ err: error, notificationId: (notification as any).id }, 'Failed to fetch source details for notification')
       }
 
-      return {
-        ...notification,
-        source: sourceDetails
-      };
-    });
+      return { ...notification, source: sourceDetails }
+    })
     
     // Get unread count for this recipient
-    const unreadCount = db.prepare(`
-      SELECT COUNT(*) as count 
-      FROM notifications 
-      WHERE recipient = ? AND read_at IS NULL AND workspace_id = ?
-    `).get(recipient, workspaceId) as { count: number };
+    const unreadCount = await prisma.notifications.count({
+      where: { recipient, read_at: null, workspace_id: workspaceId },
+    })
     
     // Get total count for pagination
-    let countQuery = 'SELECT COUNT(*) as total FROM notifications WHERE recipient = ? AND workspace_id = ?';
-    const countParams: any[] = [recipient, workspaceId];
-    if (unread_only) {
-      countQuery += ' AND read_at IS NULL';
-    }
-    if (type) {
-      countQuery += ' AND type = ?';
-      countParams.push(type);
-    }
-    const countRow = db.prepare(countQuery).get(...countParams) as { total: number };
+    const total = await prisma.notifications.count({ where })
 
     return NextResponse.json({
       notifications: enhancedNotifications,
-      total: countRow.total,
+      total,
       page: Math.floor(offset / limit) + 1,
       limit,
-      unreadCount: unreadCount.count
+      unreadCount
     });
   } catch (error) {
     logger.error({ err: error }, 'GET /api/notifications error');
@@ -139,14 +137,14 @@ export async function GET(request: NextRequest) {
  * Body: { ids: number[] } or { recipient: string } (mark all as read)
  */
 export async function PUT(request: NextRequest) {
-  const auth = requireRole(request, 'operator');
+  const auth = await requireRole(request, 'operator');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   const rateCheck = mutationLimiter(request);
   if (rateCheck) return rateCheck;
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const workspaceId = auth.user.workspace_id ?? 1;
     const body = await request.json();
     const { ids, recipient, markAllRead } = body;
@@ -155,32 +153,25 @@ export async function PUT(request: NextRequest) {
     
     if (markAllRead && recipient) {
       // Mark all notifications as read for this recipient
-      const stmt = db.prepare(`
-        UPDATE notifications 
-        SET read_at = ?
-        WHERE recipient = ? AND read_at IS NULL AND workspace_id = ?
-      `);
-      
-      const result = stmt.run(now, recipient, workspaceId);
+      const result = await prisma.notifications.updateMany({
+        where: { recipient, read_at: null, workspace_id: workspaceId },
+        data: { read_at: now },
+      })
       
       return NextResponse.json({ 
         success: true, 
-        markedAsRead: result.changes 
+        markedAsRead: result.count 
       });
     } else if (ids && Array.isArray(ids)) {
       // Mark specific notifications as read
-      const placeholders = ids.map(() => '?').join(',');
-      const stmt = db.prepare(`
-        UPDATE notifications 
-        SET read_at = ?
-        WHERE id IN (${placeholders}) AND read_at IS NULL AND workspace_id = ?
-      `);
-      
-      const result = stmt.run(now, ...ids, workspaceId);
+      const result = await prisma.notifications.updateMany({
+        where: { id: { in: ids }, read_at: null, workspace_id: workspaceId },
+        data: { read_at: now },
+      })
       
       return NextResponse.json({ 
         success: true, 
-        markedAsRead: result.changes 
+        markedAsRead: result.count 
       });
     } else {
       return NextResponse.json({ 
@@ -198,44 +189,37 @@ export async function PUT(request: NextRequest) {
  * Body: { ids: number[] } or { recipient: string, olderThan: number }
  */
 export async function DELETE(request: NextRequest) {
-  const auth = requireRole(request, 'admin');
+  const auth = await requireRole(request, 'admin');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   const rateCheck = mutationLimiter(request);
   if (rateCheck) return rateCheck;
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const workspaceId = auth.user.workspace_id ?? 1;
     const body = await request.json();
     const { ids, recipient, olderThan } = body;
     
     if (ids && Array.isArray(ids)) {
       // Delete specific notifications
-      const placeholders = ids.map(() => '?').join(',');
-      const stmt = db.prepare(`
-        DELETE FROM notifications 
-        WHERE id IN (${placeholders}) AND workspace_id = ?
-      `);
-      
-      const result = stmt.run(...ids, workspaceId);
+      const result = await prisma.notifications.deleteMany({
+        where: { id: { in: ids }, workspace_id: workspaceId },
+      })
       
       return NextResponse.json({ 
         success: true, 
-        deleted: result.changes 
+        deleted: result.count 
       });
     } else if (recipient && olderThan) {
       // Delete old notifications for recipient
-      const stmt = db.prepare(`
-        DELETE FROM notifications 
-        WHERE recipient = ? AND created_at < ? AND workspace_id = ?
-      `);
-      
-      const result = stmt.run(recipient, olderThan, workspaceId);
+      const result = await prisma.notifications.deleteMany({
+        where: { recipient, created_at: { lt: olderThan }, workspace_id: workspaceId },
+      })
       
       return NextResponse.json({ 
         success: true, 
-        deleted: result.changes 
+        deleted: result.count 
       });
     } else {
       return NextResponse.json({ 
@@ -253,14 +237,14 @@ export async function DELETE(request: NextRequest) {
  * Body: { agent: string }
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator');
+  const auth = await requireRole(request, 'operator');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   const rateCheck = mutationLimiter(request);
   if (rateCheck) return rateCheck;
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const workspaceId = auth.user.workspace_id ?? 1;
 
     const result = await validateBody(request, notificationActionSchema);
@@ -272,24 +256,20 @@ export async function POST(request: NextRequest) {
       const now = Math.floor(Date.now() / 1000);
       
       // Mark undelivered notifications as delivered
-      const stmt = db.prepare(`
-        UPDATE notifications 
-        SET delivered_at = ?
-        WHERE recipient = ? AND delivered_at IS NULL AND workspace_id = ?
-      `);
-      
-      const result = stmt.run(now, agent, workspaceId);
+      const updated = await prisma.notifications.updateMany({
+        where: { recipient: agent, delivered_at: null, workspace_id: workspaceId },
+        data: { delivered_at: now },
+      })
       
       // Get the notifications that were just marked as delivered
-      const deliveredNotifications = db.prepare(`
-        SELECT * FROM notifications 
-        WHERE recipient = ? AND delivered_at = ? AND workspace_id = ?
-        ORDER BY created_at DESC
-      `).all(agent, now, workspaceId) as Notification[];
+      const deliveredNotifications = await prisma.notifications.findMany({
+        where: { recipient: agent, delivered_at: now, workspace_id: workspaceId },
+        orderBy: { created_at: 'desc' },
+      }) as unknown as Notification[]
       
       return NextResponse.json({ 
         success: true, 
-        delivered: result.changes,
+        delivered: updated.count,
         notifications: deliveredNotifications
       });
     } else {

@@ -1,10 +1,11 @@
 import { randomUUID } from 'crypto'
 import fs from 'fs'
 import path from 'path'
-import { getDatabase, appendProvisionEvent, logAuditEvent, Tenant, ProvisionJob } from './db'
+import { appendProvisionEvent, logAuditEvent, Tenant, ProvisionJob } from './db'
 import { runCommand } from './command'
 import { runProvisionerCommand } from './provisioner-client'
 import { config as appConfig } from './config'
+import { getPrismaClient } from './prisma'
 
 export type TenantStatus = 'pending' | 'provisioning' | 'decommissioning' | 'active' | 'suspended' | 'error'
 export type ProvisionJobStatus = 'queued' | 'approved' | 'running' | 'completed' | 'failed' | 'rejected' | 'cancelled'
@@ -275,74 +276,88 @@ function ensureProvisionArtifacts(job: any) {
   fs.writeFileSync(path.join(artifactDir, 'openclaw-gateway.env'), gatewayEnv, { mode: 0o600 })
 }
 
-export function listTenants() {
-  const db = getDatabase()
-  const rows = db.prepare(`
-    SELECT t.*, pj.id as latest_job_id, pj.status as latest_job_status, pj.created_at as latest_job_created_at
-    FROM tenants t
-    LEFT JOIN provision_jobs pj ON pj.id = (
-      SELECT p2.id FROM provision_jobs p2 WHERE p2.tenant_id = t.id ORDER BY p2.created_at DESC, p2.id DESC LIMIT 1
-    )
-    ORDER BY t.created_at DESC, t.id DESC
-  `).all() as Array<Tenant & { latest_job_id: number | null; latest_job_status: string | null; latest_job_created_at: number | null }>
+export async function listTenants() {
+  const prisma = getPrismaClient()
+  const tenants = await prisma.tenants.findMany({
+    orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
+  }) as any[]
 
-  return rows.map((row) => ({
-    ...row,
-    config: parseJsonField(row.config, {}),
-  }))
+  const latestJobs = await Promise.all(
+    tenants.map(async (tenant) => {
+      const job = await prisma.provision_jobs.findFirst({
+        where: { tenant_id: tenant.id },
+        select: { id: true, status: true, created_at: true },
+        orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
+      })
+      return { tenantId: tenant.id, job }
+    })
+  )
+
+  const jobByTenant = new Map(latestJobs.map((row) => [row.tenantId, row.job]))
+
+  return tenants.map((tenant) => {
+    const job = jobByTenant.get(tenant.id) as any
+    return {
+      ...(tenant as any),
+      latest_job_id: job?.id ?? null,
+      latest_job_status: job?.status ?? null,
+      latest_job_created_at: job?.created_at ?? null,
+      config: parseJsonField(tenant.config, {}),
+    }
+  })
 }
 
-export function listProvisionJobs(filters: { tenant_id?: number; status?: string; limit?: number } = {}) {
-  const db = getDatabase()
-  const where: string[] = ['1=1']
-  const params: any[] = []
-
-  if (filters.tenant_id) {
-    where.push('pj.tenant_id = ?')
-    params.push(filters.tenant_id)
-  }
-  if (filters.status) {
-    where.push('pj.status = ?')
-    params.push(filters.status)
-  }
-
+export async function listProvisionJobs(filters: { tenant_id?: number; status?: string; limit?: number } = {}) {
+  const prisma = getPrismaClient()
   const limit = Math.min(Math.max(Number(filters.limit || 100), 1), 500)
-  params.push(limit)
 
-  const rows = db.prepare(`
-    SELECT pj.*, t.slug as tenant_slug, t.display_name as tenant_display_name
-    FROM provision_jobs pj
-    JOIN tenants t ON t.id = pj.tenant_id
-    WHERE ${where.join(' AND ')}
-    ORDER BY pj.created_at DESC, pj.id DESC
-    LIMIT ?
-  `).all(...params) as Array<ProvisionJob & { tenant_slug: string; tenant_display_name: string }>
+  const rows = await prisma.provision_jobs.findMany({
+    where: {
+      ...(filters.tenant_id ? { tenant_id: filters.tenant_id } : {}),
+      ...(filters.status ? { status: filters.status } : {}),
+    },
+    include: {
+      tenants: { select: { slug: true, display_name: true } },
+    },
+    orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
+    take: limit,
+  }) as any[]
 
   return rows.map((row) => ({
-    ...row,
+    ...(row as any),
+    tenant_slug: row.tenants?.slug ?? null,
+    tenant_display_name: row.tenants?.display_name ?? null,
     request_json: parseJsonField(row.request_json, {}),
     plan_json: parseJsonField(row.plan_json, []),
     result_json: parseJsonField(row.result_json, null),
   }))
 }
 
-export function getProvisionJob(jobId: number) {
-  const db = getDatabase()
-  const row = db.prepare(`
-    SELECT pj.*, t.slug as tenant_slug, t.display_name as tenant_display_name, t.linux_user, t.openclaw_home, t.workspace_root
-    FROM provision_jobs pj
-    JOIN tenants t ON t.id = pj.tenant_id
-    WHERE pj.id = ?
-  `).get(jobId) as any
+export async function getProvisionJob(jobId: number) {
+  const prisma = getPrismaClient()
+  const row = await prisma.provision_jobs.findUnique({
+    where: { id: jobId },
+    include: {
+      tenants: {
+        select: { slug: true, display_name: true, linux_user: true, openclaw_home: true, workspace_root: true },
+      },
+    },
+  }) as any
 
   if (!row) return null
 
-  const events = db.prepare(`
-    SELECT * FROM provision_events WHERE job_id = ? ORDER BY created_at ASC, id ASC
-  `).all(jobId)
+  const events = await prisma.provision_events.findMany({
+    where: { job_id: jobId },
+    orderBy: [{ created_at: 'asc' }, { id: 'asc' }],
+  })
 
   return {
-    ...row,
+    ...(row as any),
+    tenant_slug: row.tenants?.slug ?? null,
+    tenant_display_name: row.tenants?.display_name ?? null,
+    linux_user: row.tenants?.linux_user ?? null,
+    openclaw_home: row.tenants?.openclaw_home ?? null,
+    workspace_root: row.tenants?.workspace_root ?? null,
     request_json: parseJsonField(row.request_json, {}),
     plan_json: parseJsonField(row.plan_json, []),
     result_json: parseJsonField(row.result_json, null),
@@ -350,9 +365,8 @@ export function getProvisionJob(jobId: number) {
   }
 }
 
-export function createTenantAndBootstrapJob(request: TenantBootstrapRequest, actor: string) {
-  const db = getDatabase()
-
+export async function createTenantAndBootstrapJob(request: TenantBootstrapRequest, actor: string) {
+  const prisma = getPrismaClient()
   const templateOpenclawJsonPath =
     String(process.env.MC_SUPER_TEMPLATE_OPENCLAW_JSON || (process.env.OPENCLAW_HOME ? path.join(process.env.OPENCLAW_HOME, 'openclaw.json') : '')).trim()
   if (!templateOpenclawJsonPath) {
@@ -383,6 +397,7 @@ export function createTenantAndBootstrapJob(request: TenantBootstrapRequest, act
   const config = request.config || {}
   const dryRun = request.dry_run !== false
   const ownerGateway = normalizeOwnerGateway((request as any).owner_gateway, slug)
+  const now = Math.floor(Date.now() / 1000)
 
   if (!gatewayPort) {
     throw new Error('gateway_port is required for tenant bootstrap')
@@ -393,25 +408,26 @@ export function createTenantAndBootstrapJob(request: TenantBootstrapRequest, act
   const openclawHome = joinPosix(tenantHomeRoot, linuxUser, '.openclaw')
   const workspaceRoot = joinPosix(tenantHomeRoot, linuxUser, workspaceDirname)
 
-  const inserted = db.transaction(() => {
-    const tenantRes = db.prepare(`
-      INSERT INTO tenants (slug, display_name, linux_user, plan_tier, status, openclaw_home, workspace_root, gateway_port, dashboard_port, config, created_by, owner_gateway)
-      VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      slug,
-      displayName,
-      linuxUser,
-      planTier,
-      openclawHome,
-      workspaceRoot,
-      gatewayPort,
-      dashboardPort,
-      JSON.stringify(config),
-      actor,
-      ownerGateway
-    )
-
-    const tenantId = Number(tenantRes.lastInsertRowid)
+  const inserted = await prisma.$transaction(async (tx) => {
+    const tenant = await tx.tenants.create({
+      data: {
+        slug,
+        display_name: displayName,
+        linux_user: linuxUser,
+        plan_tier: planTier,
+        status: 'pending',
+        openclaw_home: openclawHome,
+        workspace_root: workspaceRoot,
+        gateway_port: gatewayPort,
+        dashboard_port: dashboardPort,
+        config: JSON.stringify(config),
+        created_by: actor,
+        owner_gateway: ownerGateway,
+        created_at: now,
+        updated_at: now,
+      },
+      select: { id: true },
+    })
 
     const plan = buildBootstrapPlan({
       slug,
@@ -437,23 +453,24 @@ export function createTenantAndBootstrapJob(request: TenantBootstrapRequest, act
       owner_gateway: ownerGateway,
     }
 
-    const jobRes = db.prepare(`
-      INSERT INTO provision_jobs (tenant_id, job_type, status, dry_run, requested_by, idempotency_key, request_json, plan_json, updated_at)
-      VALUES (?, 'bootstrap', 'queued', ?, ?, ?, ?, ?, (unixepoch()))
-    `).run(
-      tenantId,
-      dryRun ? 1 : 0,
-      actor,
-      randomUUID(),
-      JSON.stringify(requestPayload),
-      JSON.stringify(plan),
-    )
+    const job = await tx.provision_jobs.create({
+      data: {
+        tenant_id: tenant.id,
+        job_type: 'bootstrap',
+        status: 'queued',
+        dry_run: dryRun ? 1 : 0,
+        requested_by: actor,
+        idempotency_key: randomUUID(),
+        request_json: JSON.stringify(requestPayload),
+        plan_json: JSON.stringify(plan),
+        created_at: now,
+        updated_at: now,
+      },
+      select: { id: true },
+    })
 
-    return {
-      tenant_id: tenantId,
-      job_id: Number(jobRes.lastInsertRowid),
-    }
-  })()
+    return { tenant_id: tenant.id, job_id: job.id }
+  })
 
   appendProvisionEvent({
     job_id: inserted.job_id,
@@ -472,21 +489,19 @@ export function createTenantAndBootstrapJob(request: TenantBootstrapRequest, act
   })
 
   return {
-    tenant: db.prepare('SELECT * FROM tenants WHERE id = ?').get(inserted.tenant_id),
-    job: getProvisionJob(inserted.job_id),
+    tenant: await prisma.tenants.findUnique({ where: { id: inserted.tenant_id } }),
+    job: await getProvisionJob(inserted.job_id),
   }
 }
 
-export function createTenantDecommissionJob(tenantId: number, request: TenantDecommissionRequest, actor: string) {
-  const db = getDatabase()
+export async function createTenantDecommissionJob(tenantId: number, request: TenantDecommissionRequest, actor: string) {
+  const prisma = getPrismaClient()
 
   if (!Number.isInteger(tenantId) || tenantId <= 0) {
     throw new Error('Invalid tenant id')
   }
 
-  const tenant = db.prepare(`
-    SELECT * FROM tenants WHERE id = ?
-  `).get(tenantId) as Tenant | undefined
+  const tenant = await prisma.tenants.findUnique({ where: { id: tenantId } }) as any
 
   if (!tenant) {
     throw new Error('Tenant not found')
@@ -517,19 +532,23 @@ export function createTenantDecommissionJob(tenantId: number, request: TenantDec
     reason: reason || null,
   }
 
-  const jobRes = db.prepare(`
-    INSERT INTO provision_jobs (tenant_id, job_type, status, dry_run, requested_by, idempotency_key, request_json, plan_json, updated_at)
-    VALUES (?, 'decommission', 'queued', ?, ?, ?, ?, ?, (unixepoch()))
-  `).run(
-    tenant.id,
-    dryRun ? 1 : 0,
-    actor,
-    randomUUID(),
-    JSON.stringify(requestPayload),
-    JSON.stringify(plan),
-  )
-
-  const jobId = Number(jobRes.lastInsertRowid)
+  const now = Math.floor(Date.now() / 1000)
+  const job = await prisma.provision_jobs.create({
+    data: {
+      tenant_id: tenant.id,
+      job_type: 'decommission',
+      status: 'queued',
+      dry_run: dryRun ? 1 : 0,
+      requested_by: actor,
+      idempotency_key: randomUUID(),
+      request_json: JSON.stringify(requestPayload),
+      plan_json: JSON.stringify(plan),
+      created_at: now,
+      updated_at: now,
+    },
+    select: { id: true },
+  })
+  const jobId = job.id
 
   appendProvisionEvent({
     job_id: jobId,
@@ -547,21 +566,22 @@ export function createTenantDecommissionJob(tenantId: number, request: TenantDec
     detail: { job_id: jobId, dry_run: dryRun, remove_linux_user: removeLinuxUser, remove_state_dirs: removeStateDirs },
   })
 
-  return { tenant, job: getProvisionJob(jobId) }
+  return { tenant, job: await getProvisionJob(jobId) }
 }
 
-export function transitionProvisionJobStatus(
+export async function transitionProvisionJobStatus(
   jobId: number,
   actor: string,
   action: ProvisionJobAction,
   reason?: string
 ) {
-  const db = getDatabase()
-  const job = getProvisionJob(jobId)
+  const prisma = getPrismaClient()
+  const job = await getProvisionJob(jobId)
   if (!job) throw new Error('Job not found')
 
   const currentStatus = String(job.status)
   const normalizedReason = (reason || '').trim()
+  const now = Math.floor(Date.now() / 1000)
 
   if (['running', 'completed', 'cancelled'].includes(currentStatus)) {
     throw new Error(`Job status ${currentStatus} is immutable`)
@@ -572,11 +592,11 @@ export function transitionProvisionJobStatus(
       throw new Error(`Cannot approve job from status ${currentStatus}`)
     }
 
-    db.prepare(`
-      UPDATE provision_jobs
-      SET status = 'approved', approved_by = ?, error_text = NULL, updated_at = (unixepoch())
-      WHERE id = ?
-    `).run(actor, jobId)
+    await prisma.provision_jobs.update({
+      where: { id: jobId },
+      data: { status: 'approved', approved_by: actor, error_text: null, updated_at: now },
+      select: { id: true },
+    })
 
     appendProvisionEvent({
       job_id: jobId,
@@ -597,11 +617,11 @@ export function transitionProvisionJobStatus(
     if (!['queued', 'approved', 'failed'].includes(currentStatus)) {
       throw new Error(`Cannot reject job from status ${currentStatus}`)
     }
-    db.prepare(`
-      UPDATE provision_jobs
-      SET status = 'rejected', updated_at = (unixepoch())
-      WHERE id = ?
-    `).run(jobId)
+    await prisma.provision_jobs.update({
+      where: { id: jobId },
+      data: { status: 'rejected', updated_at: now },
+      select: { id: true },
+    })
 
     appendProvisionEvent({
       job_id: jobId,
@@ -622,11 +642,11 @@ export function transitionProvisionJobStatus(
     if (!['queued', 'approved', 'failed', 'rejected'].includes(currentStatus)) {
       throw new Error(`Cannot cancel job from status ${currentStatus}`)
     }
-    db.prepare(`
-      UPDATE provision_jobs
-      SET status = 'cancelled', completed_at = (unixepoch()), updated_at = (unixepoch())
-      WHERE id = ?
-    `).run(jobId)
+    await prisma.provision_jobs.update({
+      where: { id: jobId },
+      data: { status: 'cancelled', completed_at: now, updated_at: now },
+      select: { id: true },
+    })
 
     appendProvisionEvent({
       job_id: jobId,
@@ -647,7 +667,7 @@ export function transitionProvisionJobStatus(
     throw new Error(`Unsupported action: ${action}`)
   }
 
-  return getProvisionJob(jobId)
+  return await getProvisionJob(jobId)
 }
 
 async function runProvisionStep(step: ProvisionStep, dryRun: boolean) {
@@ -693,8 +713,8 @@ async function runProvisionStep(step: ProvisionStep, dryRun: boolean) {
 }
 
 export async function executeProvisionJob(jobId: number, actor: string) {
-  const db = getDatabase()
-  const job = getProvisionJob(jobId)
+  const prisma = getPrismaClient()
+  const job = await getProvisionJob(jobId)
   const jobType = String(job?.job_type || 'bootstrap')
   if (!job) throw new Error('Job not found')
 
@@ -706,7 +726,10 @@ export async function executeProvisionJob(jobId: number, actor: string) {
   if (!plan.length) throw new Error('Job plan is empty')
 
   const dryRun = Number(job.dry_run) === 1
-  const tenantRow = db.prepare('SELECT status FROM tenants WHERE id = ?').get(job.tenant_id) as { status?: string } | undefined
+  const tenantRow = await prisma.tenants.findUnique({
+    where: { id: job.tenant_id },
+    select: { status: true },
+  }) as any
   const previousTenantStatus = String(tenantRow?.status || 'pending')
   const allowExec = String(process.env.MC_SUPER_PROVISION_EXEC || '').toLowerCase() === 'true'
   const requestedBy = String(job.requested_by || '')
@@ -734,20 +757,26 @@ export async function executeProvisionJob(jobId: number, actor: string) {
     ensureProvisionArtifacts(job)
   }
 
-  db.prepare(`
-    UPDATE provision_jobs
-    SET status = 'running', started_at = (unixepoch()), updated_at = (unixepoch()), runner_host = ?
-    WHERE id = ?
-  `).run(process.env.HOSTNAME || 'unknown', jobId)
+  const now = Math.floor(Date.now() / 1000)
+  await prisma.provision_jobs.update({
+    where: { id: jobId },
+    data: {
+      status: 'running',
+      started_at: now,
+      updated_at: now,
+      runner_host: process.env.HOSTNAME || 'unknown',
+    },
+    select: { id: true },
+  })
 
   const startedTenantStatus = dryRun
     ? previousTenantStatus
     : (jobType === 'decommission' ? 'decommissioning' : 'provisioning')
-  db.prepare(`
-    UPDATE tenants
-    SET status = ?, updated_at = (unixepoch())
-    WHERE id = ?
-  `).run(startedTenantStatus, job.tenant_id)
+  await prisma.tenants.update({
+    where: { id: job.tenant_id },
+    data: { status: startedTenantStatus, updated_at: now },
+    select: { id: true },
+  })
 
   appendProvisionEvent({
     job_id: jobId,
@@ -804,18 +833,22 @@ export async function executeProvisionJob(jobId: number, actor: string) {
       })
     }
 
-    db.prepare(`
-      UPDATE provision_jobs
-      SET status = 'completed', completed_at = (unixepoch()), result_json = ?, error_text = NULL, updated_at = (unixepoch())
-      WHERE id = ?
-    `).run(
-      JSON.stringify({
-        dry_run: dryRun,
-        steps_executed: stepResults.length,
-        steps: stepResults,
-      }),
-      jobId,
-    )
+    const completedAt = Math.floor(Date.now() / 1000)
+    await prisma.provision_jobs.update({
+      where: { id: jobId },
+      data: {
+        status: 'completed',
+        completed_at: completedAt,
+        result_json: JSON.stringify({
+          dry_run: dryRun,
+          steps_executed: stepResults.length,
+          steps: stepResults,
+        }),
+        error_text: null,
+        updated_at: completedAt,
+      },
+      select: { id: true },
+    })
 
     const completedTenantStatus = (() => {
       if (jobType === 'decommission') {
@@ -825,11 +858,11 @@ export async function executeProvisionJob(jobId: number, actor: string) {
       // even in dry-run mode, so workspace lifecycle is not stuck in pending.
       return 'active'
     })()
-    db.prepare(`
-      UPDATE tenants
-      SET status = ?, updated_at = (unixepoch())
-      WHERE id = ?
-    `).run(completedTenantStatus, job.tenant_id)
+    await prisma.tenants.update({
+      where: { id: job.tenant_id },
+      data: { status: completedTenantStatus, updated_at: completedAt },
+      select: { id: true },
+    })
 
     appendProvisionEvent({
       job_id: jobId,
@@ -848,21 +881,24 @@ export async function executeProvisionJob(jobId: number, actor: string) {
   } catch (error: any) {
     const message = error?.message || String(error)
 
-    db.prepare(`
-      UPDATE provision_jobs
-      SET status = 'failed', completed_at = (unixepoch()), error_text = ?, result_json = ?, updated_at = (unixepoch())
-      WHERE id = ?
-    `).run(
-      message,
-      JSON.stringify({ dry_run: dryRun, steps: stepResults }),
-      jobId,
-    )
+    const failedAt = Math.floor(Date.now() / 1000)
+    await prisma.provision_jobs.update({
+      where: { id: jobId },
+      data: {
+        status: 'failed',
+        completed_at: failedAt,
+        error_text: message,
+        result_json: JSON.stringify({ dry_run: dryRun, steps: stepResults }),
+        updated_at: failedAt,
+      },
+      select: { id: true },
+    })
 
-    db.prepare(`
-      UPDATE tenants
-      SET status = 'error', updated_at = (unixepoch())
-      WHERE id = ?
-    `).run(job.tenant_id)
+    await prisma.tenants.update({
+      where: { id: job.tenant_id },
+      data: { status: 'error', updated_at: failedAt },
+      select: { id: true },
+    })
 
     appendProvisionEvent({
       job_id: jobId,
@@ -882,5 +918,5 @@ export async function executeProvisionJob(jobId: number, actor: string) {
     throw error
   }
 
-  return getProvisionJob(jobId)
+  return await getProvisionJob(jobId)
 }

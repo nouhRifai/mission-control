@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
-import { getDatabase } from '@/lib/db'
 import { calculateTokenCost } from '@/lib/token-pricing'
 import { getProviderSubscriptionFlags } from '@/lib/provider-subscriptions'
 import { logger } from '@/lib/logger'
+import { getPrismaClient, isPostgresProvider } from '@/lib/prisma'
 
 interface AgentBreakdownRow {
   agent_name: string
@@ -12,7 +12,6 @@ interface AgentBreakdownRow {
   session_count: number
   request_count: number
   last_active: number
-  models_json: string
 }
 
 interface ModelBreakdown {
@@ -41,7 +40,7 @@ interface AgentBreakdown {
  *   days=N  - Time window in days (default 30)
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
@@ -49,82 +48,109 @@ export async function GET(request: NextRequest) {
     const days = Math.max(1, Math.min(365, Number(searchParams.get('days') || 30)))
     const workspaceId = auth.user.workspace_id ?? 1
 
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const cutoff = Math.floor(Date.now() / 1000) - days * 86400
     const providerSubscriptions = getProviderSubscriptionFlags()
 
     // Query per-agent totals with per-model breakdown embedded as JSON
-    const rows = db.prepare(`
-      SELECT
-        CASE
-          WHEN INSTR(session_id, ':') > 0 THEN SUBSTR(session_id, 1, INSTR(session_id, ':') - 1)
-          ELSE session_id
-        END AS agent_name,
-        SUM(input_tokens)  AS total_input_tokens,
-        SUM(output_tokens) AS total_output_tokens,
-        COUNT(DISTINCT session_id) AS session_count,
-        COUNT(*)           AS request_count,
-        MAX(created_at)    AS last_active,
-        GROUP_CONCAT(DISTINCT model) AS models_json
-      FROM token_usage
-      WHERE workspace_id = ?
-        AND created_at >= ?
-      GROUP BY agent_name
-      ORDER BY (SUM(input_tokens) + SUM(output_tokens)) DESC
-    `).all(workspaceId, cutoff) as AgentBreakdownRow[]
+    const rows = isPostgresProvider()
+      ? ((await prisma.$queryRaw<any[]>`
+          SELECT
+            split_part(session_id, ':', 1) AS agent_name,
+            SUM(input_tokens)  AS total_input_tokens,
+            SUM(output_tokens) AS total_output_tokens,
+            COUNT(DISTINCT session_id) AS session_count,
+            COUNT(*)           AS request_count,
+            MAX(created_at)    AS last_active
+          FROM token_usage
+          WHERE workspace_id = ${workspaceId}
+            AND created_at >= ${cutoff}
+          GROUP BY agent_name
+          ORDER BY (SUM(input_tokens) + SUM(output_tokens)) DESC
+        `) as AgentBreakdownRow[])
+      : ((await prisma.$queryRaw<any[]>`
+          SELECT
+            CASE
+              WHEN INSTR(session_id, ':') > 0 THEN SUBSTR(session_id, 1, INSTR(session_id, ':') - 1)
+              ELSE session_id
+            END AS agent_name,
+            SUM(input_tokens)  AS total_input_tokens,
+            SUM(output_tokens) AS total_output_tokens,
+            COUNT(DISTINCT session_id) AS session_count,
+            COUNT(*)           AS request_count,
+            MAX(created_at)    AS last_active
+          FROM token_usage
+          WHERE workspace_id = ${workspaceId}
+            AND created_at >= ${cutoff}
+          GROUP BY agent_name
+          ORDER BY (SUM(input_tokens) + SUM(output_tokens)) DESC
+        `) as AgentBreakdownRow[])
 
     // For accurate per-model cost we need a second pass grouping by agent+model
-    const modelRows = db.prepare(`
-      SELECT
-        CASE
-          WHEN INSTR(session_id, ':') > 0 THEN SUBSTR(session_id, 1, INSTR(session_id, ':') - 1)
-          ELSE session_id
-        END AS agent_name,
-        model,
-        SUM(input_tokens)  AS input_tokens,
-        SUM(output_tokens) AS output_tokens,
-        COUNT(*)           AS request_count
-      FROM token_usage
-      WHERE workspace_id = ?
-        AND created_at >= ?
-      GROUP BY agent_name, model
-      ORDER BY agent_name, (SUM(input_tokens) + SUM(output_tokens)) DESC
-    `).all(workspaceId, cutoff) as Array<{
-      agent_name: string
-      model: string
-      input_tokens: number
-      output_tokens: number
-      request_count: number
-    }>
+    const modelRows = isPostgresProvider()
+      ? ((await prisma.$queryRaw<any[]>`
+          SELECT
+            split_part(session_id, ':', 1) AS agent_name,
+            model,
+            SUM(input_tokens)  AS input_tokens,
+            SUM(output_tokens) AS output_tokens,
+            COUNT(*)           AS request_count
+          FROM token_usage
+          WHERE workspace_id = ${workspaceId}
+            AND created_at >= ${cutoff}
+          GROUP BY agent_name, model
+          ORDER BY agent_name, (SUM(input_tokens) + SUM(output_tokens)) DESC
+        `) as any[])
+      : ((await prisma.$queryRaw<any[]>`
+          SELECT
+            CASE
+              WHEN INSTR(session_id, ':') > 0 THEN SUBSTR(session_id, 1, INSTR(session_id, ':') - 1)
+              ELSE session_id
+            END AS agent_name,
+            model,
+            SUM(input_tokens)  AS input_tokens,
+            SUM(output_tokens) AS output_tokens,
+            COUNT(*)           AS request_count
+          FROM token_usage
+          WHERE workspace_id = ${workspaceId}
+            AND created_at >= ${cutoff}
+          GROUP BY agent_name, model
+          ORDER BY agent_name, (SUM(input_tokens) + SUM(output_tokens)) DESC
+        `) as any[])
 
     // Build model map keyed by agent name
     const modelsByAgent = new Map<string, ModelBreakdown[]>()
     for (const row of modelRows) {
-      const cost = calculateTokenCost(row.model, row.input_tokens, row.output_tokens, { providerSubscriptions })
-      const list = modelsByAgent.get(row.agent_name) || []
+      const input = Number((row as any).input_tokens ?? 0)
+      const output = Number((row as any).output_tokens ?? 0)
+      const cost = calculateTokenCost(String((row as any).model), input, output, { providerSubscriptions })
+      const list = modelsByAgent.get(String((row as any).agent_name)) || []
       list.push({
-        model: row.model,
-        input_tokens: row.input_tokens,
-        output_tokens: row.output_tokens,
-        request_count: row.request_count,
+        model: String((row as any).model),
+        input_tokens: input,
+        output_tokens: output,
+        request_count: Number((row as any).request_count ?? 0),
         cost,
       })
-      modelsByAgent.set(row.agent_name, list)
+      modelsByAgent.set(String((row as any).agent_name), list)
     }
 
     // Assemble final response
     const agents: AgentBreakdown[] = rows.map((row) => {
-      const models = modelsByAgent.get(row.agent_name) || []
+      const agentName = String((row as any).agent_name)
+      const totalInput = Number((row as any).total_input_tokens ?? 0)
+      const totalOutput = Number((row as any).total_output_tokens ?? 0)
+      const models = modelsByAgent.get(agentName) || []
       const totalCost = models.reduce((sum, m) => sum + m.cost, 0)
       return {
-        agent: row.agent_name,
-        total_input_tokens: row.total_input_tokens,
-        total_output_tokens: row.total_output_tokens,
-        total_tokens: row.total_input_tokens + row.total_output_tokens,
+        agent: agentName,
+        total_input_tokens: totalInput,
+        total_output_tokens: totalOutput,
+        total_tokens: totalInput + totalOutput,
         total_cost: totalCost,
-        session_count: row.session_count,
-        request_count: row.request_count,
-        last_active: new Date(row.last_active * 1000).toISOString(),
+        session_count: Number((row as any).session_count ?? 0),
+        request_count: Number((row as any).request_count ?? 0),
+        last_active: new Date(Number((row as any).last_active ?? 0) * 1000).toISOString(),
         models,
       }
     })

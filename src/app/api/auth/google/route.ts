@@ -1,29 +1,48 @@
-import { randomBytes } from 'crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { createSession } from '@/lib/auth'
-import { getDatabase, logAuditEvent } from '@/lib/db'
+import { logAuditEvent } from '@/lib/db'
 import { verifyGoogleIdToken } from '@/lib/google-auth'
 import { getMcSessionCookieName, getMcSessionCookieOptions, isRequestSecure } from '@/lib/session-cookie'
 import { loginLimiter } from '@/lib/rate-limit'
+import { getPrismaClient } from '@/lib/prisma'
 
-function upsertAccessRequest(input: {
+async function upsertAccessRequest(input: {
   email: string
   providerUserId: string
   displayName: string
   avatarUrl?: string
 }) {
-  const db = getDatabase()
-  db.prepare(`
-    INSERT INTO access_requests (provider, email, provider_user_id, display_name, avatar_url, status, attempt_count, requested_at, last_attempt_at)
-    VALUES ('google', ?, ?, ?, ?, 'pending', 1, (unixepoch()), (unixepoch()))
-    ON CONFLICT(email, provider) DO UPDATE SET
-      provider_user_id = excluded.provider_user_id,
-      display_name = excluded.display_name,
-      avatar_url = excluded.avatar_url,
-      status = 'pending',
-      attempt_count = access_requests.attempt_count + 1,
-      last_attempt_at = (unixepoch())
-  `).run(input.email.toLowerCase(), input.providerUserId, input.displayName, input.avatarUrl || null)
+  const prisma = getPrismaClient()
+  const now = Math.floor(Date.now() / 1000)
+
+  await prisma.access_requests.upsert({
+    where: {
+      email_provider: {
+        email: input.email.toLowerCase(),
+        provider: 'google',
+      },
+    },
+    create: {
+      provider: 'google',
+      email: input.email.toLowerCase(),
+      provider_user_id: input.providerUserId,
+      display_name: input.displayName,
+      avatar_url: input.avatarUrl || null,
+      status: 'pending',
+      attempt_count: 1,
+      requested_at: now,
+      last_attempt_at: now,
+    } as any,
+    update: {
+      provider_user_id: input.providerUserId,
+      display_name: input.displayName,
+      avatar_url: input.avatarUrl || null,
+      status: 'pending',
+      attempt_count: { increment: 1 },
+      last_attempt_at: now,
+    } as any,
+    select: { id: true },
+  })
 }
 
 export async function POST(request: NextRequest) {
@@ -35,27 +54,29 @@ export async function POST(request: NextRequest) {
     const credential = String(body?.credential || '')
     const profile = await verifyGoogleIdToken(credential)
 
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const email = String(profile.email || '').toLowerCase().trim()
     const sub = String(profile.sub || '').trim()
     const displayName = String(profile.name || email.split('@')[0] || 'Google User').trim()
     const avatar = profile.picture ? String(profile.picture) : null
 
-    const row = db.prepare(`
-      SELECT u.id, u.username, u.display_name, u.role, u.provider, u.email, u.avatar_url, u.is_approved,
-             u.created_at, u.updated_at, u.last_login_at, u.workspace_id, COALESCE(w.tenant_id, 1) as tenant_id
-      FROM users u
-      LEFT JOIN workspaces w ON w.id = u.workspace_id
-      WHERE (provider = 'google' AND provider_user_id = ?) OR lower(email) = ?
-      ORDER BY id ASC
-      LIMIT 1
-    `).get(sub, email) as any
+    const row = (
+      await prisma.$queryRaw<any[]>`
+        SELECT u.id, u.username, u.display_name, u.role, u.provider, u.email, u.avatar_url, u.is_approved,
+               u.created_at, u.updated_at, u.last_login_at, u.workspace_id, COALESCE(w.tenant_id, 1) as tenant_id
+        FROM users u
+        LEFT JOIN workspaces w ON w.id = u.workspace_id
+        WHERE (provider = 'google' AND provider_user_id = ${sub}) OR lower(email) = ${email}
+        ORDER BY id ASC
+        LIMIT 1
+      `
+    )[0] as any
 
     const ipAddress = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown'
     const userAgent = request.headers.get('user-agent') || undefined
 
     if (!row || Number(row.is_approved ?? 1) !== 1) {
-      upsertAccessRequest({
+      await upsertAccessRequest({
         email,
         providerUserId: sub,
         displayName,
@@ -76,13 +97,20 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    db.prepare(`
-      UPDATE users
-      SET provider = 'google', provider_user_id = ?, email = ?, avatar_url = COALESCE(?, avatar_url), updated_at = (unixepoch())
-      WHERE id = ?
-    `).run(sub, email, avatar, row.id)
+    const now = Math.floor(Date.now() / 1000)
+    await prisma.users.update({
+      where: { id: row.id },
+      data: {
+        provider: 'google',
+        provider_user_id: sub,
+        email,
+        ...(avatar ? { avatar_url: avatar } : {}),
+        updated_at: now,
+      } as any,
+      select: { id: true },
+    })
 
-    const { token, expiresAt } = createSession(row.id, ipAddress, userAgent, row.workspace_id ?? 1)
+    const { token, expiresAt } = await createSession(row.id, ipAddress, userAgent, row.workspace_id ?? 1)
 
     logAuditEvent({ action: 'login_google', actor: row.username, actor_id: row.id, ip_address: ipAddress, user_agent: userAgent })
 

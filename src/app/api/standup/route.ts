@@ -1,18 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDatabase, db_helpers } from '@/lib/db';
+import { db_helpers } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
 import { logger } from '@/lib/logger';
+import { getPrismaClient } from '@/lib/prisma';
+import { Prisma } from '@/generated/prisma/sqlite';
 
 /**
  * POST /api/standup/generate - Generate daily standup report
  * Body: { date?: string, agents?: string[] }
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator');
+  const auth = await requireRole(request, 'operator');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const body = await request.json();
     const workspaceId = auth.user.workspace_id ?? 1;
     
@@ -24,87 +26,168 @@ export async function POST(request: NextRequest) {
     const startOfDay = Math.floor(new Date(`${targetDate}T00:00:00Z`).getTime() / 1000);
     const endOfDay = Math.floor(new Date(`${targetDate}T23:59:59Z`).getTime() / 1000);
     
-    // Get all active agents or filter by specific agents
-    let agentQuery = 'SELECT * FROM agents WHERE workspace_id = ?';
-    const agentParams: any[] = [workspaceId];
-    
-    if (specificAgents && Array.isArray(specificAgents) && specificAgents.length > 0) {
-      const placeholders = specificAgents.map(() => '?').join(',');
-      agentQuery += ` AND name IN (${placeholders})`;
-      agentParams.push(...specificAgents);
+    const agents = await prisma.agents.findMany({
+      where: {
+        workspace_id: workspaceId,
+        ...(specificAgents && Array.isArray(specificAgents) && specificAgents.length > 0
+          ? { name: { in: specificAgents.map((v: any) => String(v)) } }
+          : {}),
+      } as any,
+      orderBy: { name: 'asc' },
+      select: { name: true, role: true, status: true, last_seen: true, last_activity: true },
+    }) as Array<{ name: string; role: string; status: string; last_seen: number | null; last_activity: string | null }>;
+
+    const agentNames = agents.map((a) => a.name).filter(Boolean);
+
+    const [
+      completedTasks,
+      inProgressTasks,
+      assignedTasks,
+      reviewTasks,
+      blockedTasks,
+      overdueTasks,
+      activityCounts,
+      commentCounts,
+    ] = await Promise.all([
+      agentNames.length
+        ? prisma.tasks.findMany({
+            where: {
+              workspace_id: workspaceId,
+              assigned_to: { in: agentNames },
+              status: 'done',
+              updated_at: { gte: startOfDay, lte: endOfDay },
+            } as any,
+            select: { id: true, title: true, status: true, updated_at: true, assigned_to: true },
+            orderBy: { updated_at: 'desc' },
+          })
+        : Promise.resolve([]),
+      agentNames.length
+        ? prisma.tasks.findMany({
+            where: { workspace_id: workspaceId, assigned_to: { in: agentNames }, status: 'in_progress' } as any,
+            select: { id: true, title: true, status: true, created_at: true, due_date: true, assigned_to: true },
+            orderBy: { created_at: 'asc' },
+          })
+        : Promise.resolve([]),
+      agentNames.length
+        ? prisma.tasks.findMany({
+            where: { workspace_id: workspaceId, assigned_to: { in: agentNames }, status: 'assigned' } as any,
+            select: { id: true, title: true, status: true, created_at: true, due_date: true, priority: true, assigned_to: true },
+            orderBy: [{ priority: 'desc' }, { created_at: 'asc' }],
+          })
+        : Promise.resolve([]),
+      agentNames.length
+        ? prisma.tasks.findMany({
+            where: { workspace_id: workspaceId, assigned_to: { in: agentNames }, status: { in: ['review', 'quality_review'] } } as any,
+            select: { id: true, title: true, status: true, updated_at: true, assigned_to: true },
+            orderBy: { updated_at: 'asc' },
+          })
+        : Promise.resolve([]),
+      agentNames.length
+        ? prisma.tasks.findMany({
+            where: {
+              workspace_id: workspaceId,
+              assigned_to: { in: agentNames },
+              status: { notIn: ['done'] },
+              OR: [{ priority: 'urgent' }, { metadata: { contains: 'blocked' } }],
+            } as any,
+            select: { id: true, title: true, status: true, priority: true, created_at: true, metadata: true, assigned_to: true },
+            orderBy: [{ priority: 'desc' }, { created_at: 'asc' }],
+          })
+        : Promise.resolve([]),
+      prisma.$queryRaw<any[]>`
+        SELECT t.*, a.name as agent_name
+        FROM tasks t
+        LEFT JOIN agents a ON t.assigned_to = a.name
+        AND a.workspace_id = t.workspace_id
+        WHERE t.due_date < ${Math.floor(Date.now() / 1000)}
+        AND t.workspace_id = ${workspaceId}
+        AND t.status NOT IN ('done')
+        ORDER BY t.due_date ASC
+      `,
+      agentNames.length
+        ? prisma.$queryRaw<any[]>`
+            SELECT actor as name, COUNT(*) as count
+            FROM activities
+            WHERE workspace_id = ${workspaceId}
+              AND created_at BETWEEN ${startOfDay} AND ${endOfDay}
+              AND actor IN (${Prisma.join(agentNames)})
+            GROUP BY actor
+          `
+        : Promise.resolve([]),
+      agentNames.length
+        ? prisma.$queryRaw<any[]>`
+            SELECT author as name, COUNT(*) as count
+            FROM comments
+            WHERE workspace_id = ${workspaceId}
+              AND created_at BETWEEN ${startOfDay} AND ${endOfDay}
+              AND author IN (${Prisma.join(agentNames)})
+            GROUP BY author
+          `
+        : Promise.resolve([]),
+    ]);
+
+    const completedByAgent = new Map<string, any[]>();
+    for (const t of completedTasks as any[]) {
+      const { assigned_to, ...rest } = t as any;
+      const key = String(assigned_to || '');
+      const list = completedByAgent.get(key) || [];
+      list.push(rest);
+      completedByAgent.set(key, list);
     }
-    
-    agentQuery += ' ORDER BY name';
-    
-    const agents = db.prepare(agentQuery).all(...agentParams) as any[];
-    
-    // Prepare statements once (avoids N+1 per agent)
-    const completedTasksStmt = db.prepare(`
-      SELECT id, title, status, updated_at
-      FROM tasks
-      WHERE assigned_to = ?
-      AND workspace_id = ?
-      AND status = 'done'
-      AND updated_at BETWEEN ? AND ?
-      ORDER BY updated_at DESC
-    `);
-    const inProgressTasksStmt = db.prepare(`
-      SELECT id, title, status, created_at, due_date
-      FROM tasks
-      WHERE assigned_to = ?
-      AND workspace_id = ?
-      AND status = 'in_progress'
-      ORDER BY created_at ASC
-    `);
-    const assignedTasksStmt = db.prepare(`
-      SELECT id, title, status, created_at, due_date, priority
-      FROM tasks
-      WHERE assigned_to = ?
-      AND workspace_id = ?
-      AND status = 'assigned'
-      ORDER BY priority DESC, created_at ASC
-    `);
-    const reviewTasksStmt = db.prepare(`
-      SELECT id, title, status, updated_at
-      FROM tasks
-      WHERE assigned_to = ?
-      AND workspace_id = ?
-      AND status IN ('review', 'quality_review')
-      ORDER BY updated_at ASC
-    `);
-    const blockedTasksStmt = db.prepare(`
-      SELECT id, title, status, priority, created_at, metadata
-      FROM tasks
-      WHERE assigned_to = ?
-      AND workspace_id = ?
-      AND (priority = 'urgent' OR metadata LIKE '%blocked%')
-      AND status NOT IN ('done')
-      ORDER BY priority DESC, created_at ASC
-    `);
-    const activityCountStmt = db.prepare(`
-      SELECT COUNT(*) as count
-      FROM activities
-      WHERE actor = ?
-      AND workspace_id = ?
-      AND created_at BETWEEN ? AND ?
-    `);
-    const commentCountStmt = db.prepare(`
-      SELECT COUNT(*) as count
-      FROM comments
-      WHERE author = ?
-      AND workspace_id = ?
-      AND created_at BETWEEN ? AND ?
-    `);
+
+    const inProgressByAgent = new Map<string, any[]>();
+    for (const t of inProgressTasks as any[]) {
+      const { assigned_to, ...rest } = t as any;
+      const key = String(assigned_to || '');
+      const list = inProgressByAgent.get(key) || [];
+      list.push(rest);
+      inProgressByAgent.set(key, list);
+    }
+
+    const assignedByAgent = new Map<string, any[]>();
+    for (const t of assignedTasks as any[]) {
+      const { assigned_to, ...rest } = t as any;
+      const key = String(assigned_to || '');
+      const list = assignedByAgent.get(key) || [];
+      list.push(rest);
+      assignedByAgent.set(key, list);
+    }
+
+    const reviewByAgent = new Map<string, any[]>();
+    for (const t of reviewTasks as any[]) {
+      const { assigned_to, ...rest } = t as any;
+      const key = String(assigned_to || '');
+      const list = reviewByAgent.get(key) || [];
+      list.push(rest);
+      reviewByAgent.set(key, list);
+    }
+
+    const blockedByAgent = new Map<string, any[]>();
+    for (const t of blockedTasks as any[]) {
+      const { assigned_to, ...rest } = t as any;
+      const key = String(assigned_to || '');
+      const list = blockedByAgent.get(key) || [];
+      list.push(rest);
+      blockedByAgent.set(key, list);
+    }
+
+    const activityCountByAgent = new Map<string, number>();
+    for (const row of activityCounts as any[]) {
+      activityCountByAgent.set(String(row.name), Number(row.count ?? 0));
+    }
+
+    const commentCountByAgent = new Map<string, number>();
+    for (const row of commentCounts as any[]) {
+      commentCountByAgent.set(String(row.name), Number(row.count ?? 0));
+    }
 
     // Generate standup data for each agent
     const standupData = agents.map(agent => {
-      const completedTasks = completedTasksStmt.all(agent.name, workspaceId, startOfDay, endOfDay);
-      const inProgressTasks = inProgressTasksStmt.all(agent.name, workspaceId);
-      const assignedTasks = assignedTasksStmt.all(agent.name, workspaceId);
-      const reviewTasks = reviewTasksStmt.all(agent.name, workspaceId);
-      const blockedTasks = blockedTasksStmt.all(agent.name, workspaceId);
-      const activityCount = activityCountStmt.get(agent.name, workspaceId, startOfDay, endOfDay) as { count: number };
-      const commentsToday = commentCountStmt.get(agent.name, workspaceId, startOfDay, endOfDay) as { count: number };
+      const completedToday = completedByAgent.get(agent.name) || [];
+      const inProgress = inProgressByAgent.get(agent.name) || [];
+      const assigned = assignedByAgent.get(agent.name) || [];
+      const review = reviewByAgent.get(agent.name) || [];
+      const blocked = blockedByAgent.get(agent.name) || [];
 
       return {
         agent: {
@@ -114,14 +197,14 @@ export async function POST(request: NextRequest) {
           last_seen: agent.last_seen,
           last_activity: agent.last_activity
         },
-        completedToday: completedTasks,
-        inProgress: inProgressTasks,
-        assigned: assignedTasks,
-        review: reviewTasks,
-        blocked: blockedTasks,
+        completedToday,
+        inProgress,
+        assigned,
+        review,
+        blocked,
         activity: {
-          actionCount: activityCount.count,
-          commentsCount: commentsToday.count
+          actionCount: activityCountByAgent.get(agent.name) || 0,
+          commentsCount: commentCountByAgent.get(agent.name) || 0
         }
       };
     });
@@ -147,19 +230,6 @@ export async function POST(request: NextRequest) {
         return (priorityOrder[b.priority] || 0) - (priorityOrder[a.priority] || 0) || a.created_at - b.created_at;
       });
     
-    // Get overdue tasks across all agents
-    const now = Math.floor(Date.now() / 1000);
-    const overdueTasks = db.prepare(`
-      SELECT t.*, a.name as agent_name
-      FROM tasks t
-      LEFT JOIN agents a ON t.assigned_to = a.name
-      AND a.workspace_id = t.workspace_id
-      WHERE t.due_date < ? 
-      AND t.workspace_id = ?
-      AND t.status NOT IN ('done')
-      ORDER BY t.due_date ASC
-    `).all(now, workspaceId);
-    
     const standupReport = {
       date: targetDate,
       generatedAt: new Date().toISOString(),
@@ -181,10 +251,11 @@ export async function POST(request: NextRequest) {
 
     // Persist standup report
     const createdAt = Math.floor(Date.now() / 1000);
-    db.prepare(`
-      INSERT OR REPLACE INTO standup_reports (date, report, created_at, workspace_id)
-      VALUES (?, ?, ?, ?)
-    `).run(targetDate, JSON.stringify(standupReport), createdAt, workspaceId);
+    await prisma.standup_reports.upsert({
+      where: { date: targetDate },
+      create: { date: targetDate, report: JSON.stringify(standupReport), created_at: createdAt, workspace_id: workspaceId } as any,
+      update: { report: JSON.stringify(standupReport), created_at: createdAt, workspace_id: workspaceId } as any,
+    })
     
     // Log the standup generation
     db_helpers.logActivity(
@@ -219,24 +290,24 @@ export async function POST(request: NextRequest) {
  * Query params: limit, offset
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer');
+  const auth = await requireRole(request, 'viewer');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const { searchParams } = new URL(request.url);
     const workspaceId = auth.user.workspace_id ?? 1;
 
     const limit = Math.min(parseInt(searchParams.get('limit') || '10'), 200);
     const offset = parseInt(searchParams.get('offset') || '0');
     
-    const standupRows = db.prepare(`
-      SELECT date, report, created_at
-      FROM standup_reports
-      WHERE workspace_id = ?
-      ORDER BY created_at DESC
-      LIMIT ? OFFSET ?
-    `).all(workspaceId, limit, offset) as Array<{ date: string; report: string; created_at: number }>;
+    const standupRows = await prisma.standup_reports.findMany({
+      where: { workspace_id: workspaceId } as any,
+      orderBy: { created_at: 'desc' },
+      take: limit,
+      skip: offset,
+      select: { date: true, report: true, created_at: true },
+    }) as Array<{ date: string; report: string; created_at: number }>;
 
     const standupHistory = standupRows.map((row, index) => {
       const report = row.report ? JSON.parse(row.report) : {};
@@ -249,13 +320,11 @@ export async function GET(request: NextRequest) {
       };
     });
     
-    const countRow = db
-      .prepare('SELECT COUNT(*) as total FROM standup_reports WHERE workspace_id = ?')
-      .get(workspaceId) as { total: number };
+    const total = await prisma.standup_reports.count({ where: { workspace_id: workspaceId } as any });
 
     return NextResponse.json({
       history: standupHistory,
-      total: countRow.total,
+      total,
       page: Math.floor(offset / limit) + 1,
       limit
     });

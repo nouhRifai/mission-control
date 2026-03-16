@@ -1,8 +1,8 @@
 import { createHash, randomBytes } from 'crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
-import { getDatabase } from '@/lib/db'
 import { logger } from '@/lib/logger'
+import { getPrismaClient } from '@/lib/prisma'
 
 const ALLOWED_SCOPES = new Set([
   'viewer',
@@ -38,16 +38,19 @@ function hashApiKey(rawKey: string): string {
   return createHash('sha256').update(rawKey).digest('hex')
 }
 
-function resolveAgent(db: ReturnType<typeof getDatabase>, idParam: string, workspaceId: number): AgentRow | null {
+async function resolveAgent(idParam: string, workspaceId: number): Promise<AgentRow | null> {
+  const prisma = getPrismaClient()
   if (/^\d+$/.test(idParam)) {
-    return (db
-      .prepare(`SELECT id, name, workspace_id FROM agents WHERE id = ? AND workspace_id = ?`)
-      .get(Number(idParam), workspaceId) as AgentRow | undefined) || null
+    return await prisma.agents.findFirst({
+      where: { id: Number(idParam), workspace_id: workspaceId },
+      select: { id: true, name: true, workspace_id: true },
+    })
   }
 
-  return (db
-    .prepare(`SELECT id, name, workspace_id FROM agents WHERE name = ? AND workspace_id = ?`)
-    .get(idParam, workspaceId) as AgentRow | undefined) || null
+  return await prisma.agents.findFirst({
+    where: { name: idParam, workspace_id: workspaceId },
+    select: { id: true, name: true, workspace_id: true },
+  })
 }
 
 function parseScopes(rawScopes: unknown): string[] {
@@ -84,24 +87,32 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const resolved = await params
     const workspaceId = auth.user.workspace_id ?? 1
-    const agent = resolveAgent(db, resolved.id, workspaceId)
+    const agent = await resolveAgent(resolved.id, workspaceId)
     if (!agent) return NextResponse.json({ error: 'Agent not found' }, { status: 404 })
 
-    const rows = db
-      .prepare(`
-        SELECT id, name, key_prefix, scopes, created_by, expires_at, revoked_at, last_used_at, created_at, updated_at
-        FROM agent_api_keys
-        WHERE agent_id = ? AND workspace_id = ?
-        ORDER BY created_at DESC, id DESC
-      `)
-      .all(agent.id, workspaceId) as AgentKeyRow[]
+    const rows = (await prisma.agent_api_keys.findMany({
+      where: { agent_id: agent.id, workspace_id: workspaceId },
+      select: {
+        id: true,
+        name: true,
+        key_prefix: true,
+        scopes: true,
+        created_by: true,
+        expires_at: true,
+        revoked_at: true,
+        last_used_at: true,
+        created_at: true,
+        updated_at: true,
+      },
+      orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
+    })) as unknown as AgentKeyRow[]
 
     return NextResponse.json({
       agent: { id: agent.id, name: agent.name },
@@ -127,14 +138,14 @@ export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const resolved = await params
     const workspaceId = auth.user.workspace_id ?? 1
-    const agent = resolveAgent(db, resolved.id, workspaceId)
+    const agent = await resolveAgent(resolved.id, workspaceId)
     if (!agent) return NextResponse.json({ error: 'Agent not found' }, { status: 404 })
 
     const body = await request.json().catch(() => ({}))
@@ -154,29 +165,28 @@ export async function POST(
     const keyHash = hashApiKey(rawKey)
     const keyPrefix = rawKey.slice(0, 12)
 
-    const result = db
-      .prepare(`
-        INSERT INTO agent_api_keys (
-          agent_id, workspace_id, name, key_hash, key_prefix, scopes, expires_at, created_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `)
-      .run(
-        agent.id,
-        workspaceId,
+    const created = await prisma.agent_api_keys.create({
+      data: {
+        agent_id: agent.id,
+        workspace_id: workspaceId,
         name,
-        keyHash,
-        keyPrefix,
-        JSON.stringify(scopes),
-        expiresAt,
-        auth.user.username,
-        now,
-        now,
-      )
+        key_hash: keyHash,
+        key_prefix: keyPrefix,
+        scopes: JSON.stringify(scopes),
+        expires_at: expiresAt,
+        revoked_at: null,
+        last_used_at: null,
+        created_by: auth.user.username,
+        created_at: now,
+        updated_at: now,
+      },
+      select: { id: true },
+    })
 
     return NextResponse.json(
       {
         key: {
-          id: Number(result.lastInsertRowid),
+          id: created.id,
           name,
           key_prefix: keyPrefix,
           scopes,
@@ -197,14 +207,14 @@ export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const resolved = await params
     const workspaceId = auth.user.workspace_id ?? 1
-    const agent = resolveAgent(db, resolved.id, workspaceId)
+    const agent = await resolveAgent(resolved.id, workspaceId)
     if (!agent) return NextResponse.json({ error: 'Agent not found' }, { status: 404 })
 
     const body = await request.json().catch(() => ({}))
@@ -214,15 +224,17 @@ export async function DELETE(
     }
 
     const now = Math.floor(Date.now() / 1000)
-    const result = db
-      .prepare(`
-        UPDATE agent_api_keys
-        SET revoked_at = ?, updated_at = ?
-        WHERE id = ? AND agent_id = ? AND workspace_id = ? AND revoked_at IS NULL
-      `)
-      .run(now, now, keyId, agent.id, workspaceId)
+    const result = await prisma.agent_api_keys.updateMany({
+      where: {
+        id: keyId,
+        agent_id: agent.id,
+        workspace_id: workspaceId,
+        revoked_at: null,
+      },
+      data: { revoked_at: now, updated_at: now },
+    })
 
-    if (result.changes < 1) {
+    if (result.count < 1) {
       return NextResponse.json({ error: 'Active key not found for this agent' }, { status: 404 })
     }
 

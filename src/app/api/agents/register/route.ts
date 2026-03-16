@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getDatabase, db_helpers } from '@/lib/db'
+import { db_helpers } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { selfRegisterLimiter } from '@/lib/rate-limit'
 import { logAuditEvent } from '@/lib/db'
 import { eventBus } from '@/lib/event-bus'
 import { logger } from '@/lib/logger'
+import { getPrismaClient } from '@/lib/prisma'
 
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$/
 const VALID_ROLES = ['coder', 'reviewer', 'tester', 'devops', 'researcher', 'assistant', 'agent']
@@ -21,7 +22,7 @@ const VALID_ROLES = ['coder', 'reviewer', 'tester', 'devops', 'researcher', 'ass
  * Rate-limited to 5 registrations/min per IP to prevent spam.
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const limited = selfRegisterLimiter(request)
@@ -52,19 +53,21 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const workspaceId = auth.user.workspace_id ?? 1
     const now = Math.floor(Date.now() / 1000)
 
     // Check if agent already exists — idempotent: update last_seen and status
-    const existing = db.prepare(
-      'SELECT * FROM agents WHERE name = ? AND workspace_id = ?'
-    ).get(name, workspaceId) as any | undefined
+    const existing = await prisma.agents.findFirst({
+      where: { name, workspace_id: workspaceId },
+    })
 
     if (existing) {
-      db.prepare(
-        'UPDATE agents SET status = ?, last_seen = ?, updated_at = ? WHERE id = ? AND workspace_id = ?'
-      ).run('idle', now, now, existing.id, workspaceId)
+      await prisma.agents.update({
+        where: { id: existing.id },
+        data: { status: 'idle', last_seen: now, updated_at: now },
+        select: { id: true },
+      })
 
       return NextResponse.json({
         agent: {
@@ -84,12 +87,20 @@ export async function POST(request: NextRequest) {
     if (capabilities.length > 0) config.capabilities = capabilities
     if (framework) config.framework = framework
 
-    const result = db.prepare(`
-      INSERT INTO agents (name, role, status, config, created_at, updated_at, last_seen, workspace_id)
-      VALUES (?, ?, 'idle', ?, ?, ?, ?, ?)
-    `).run(name, role, JSON.stringify(config), now, now, now, workspaceId)
-
-    const agentId = Number(result.lastInsertRowid)
+    const created = await prisma.agents.create({
+      data: {
+        name,
+        role,
+        status: 'idle',
+        config: JSON.stringify(config),
+        created_at: now,
+        updated_at: now,
+        last_seen: now,
+        workspace_id: workspaceId,
+      },
+      select: { id: true },
+    })
+    const agentId = created.id
 
     db_helpers.logActivity(
       'agent_created',
@@ -125,7 +136,7 @@ export async function POST(request: NextRequest) {
       message: 'Agent registered successfully',
     }, { status: 201 })
   } catch (error: any) {
-    if (error.message?.includes('UNIQUE constraint')) {
+    if (error?.code === 'P2002' || error.message?.includes('UNIQUE constraint')) {
       // Race condition — another request registered the same name
       return NextResponse.json({ error: 'Agent name already exists' }, { status: 409 })
     }

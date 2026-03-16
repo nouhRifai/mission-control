@@ -1,13 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDatabase, Task, db_helpers } from '@/lib/db';
+import { Task, db_helpers } from '@/lib/db';
 import { eventBus } from '@/lib/event-bus';
 import { requireRole } from '@/lib/auth';
 import { mutationLimiter } from '@/lib/rate-limit';
 import { logger } from '@/lib/logger';
 import { validateBody, createTaskSchema, bulkUpdateTaskStatusSchema } from '@/lib/validation';
-import { resolveMentionRecipients } from '@/lib/mentions';
+import { resolveMentionRecipientsAsync } from '@/lib/mentions';
 import { normalizeTaskCreateStatus } from '@/lib/task-status';
 import { pushTaskToGitHub } from '@/lib/github-sync-engine';
+import { getPrismaClient } from '@/lib/prisma';
 
 function formatTicketRef(prefix?: string | null, num?: number | null): string | undefined {
   if (!prefix || typeof num !== 'number' || !Number.isFinite(num) || num <= 0) return undefined
@@ -23,36 +24,46 @@ function mapTaskRow(task: any): Task & { tags: string[]; metadata: Record<string
   }
 }
 
-function resolveProjectId(db: ReturnType<typeof getDatabase>, workspaceId: number, requestedProjectId?: number): number {
+async function resolveProjectId(
+  prisma: ReturnType<typeof getPrismaClient>,
+  workspaceId: number,
+  requestedProjectId?: number
+): Promise<number> {
   if (typeof requestedProjectId === 'number' && Number.isFinite(requestedProjectId)) {
-    const project = db.prepare(`
-      SELECT id FROM projects
-      WHERE id = ? AND workspace_id = ? AND status = 'active'
-      LIMIT 1
-    `).get(requestedProjectId, workspaceId) as { id: number } | undefined
+    const project = await prisma.projects.findFirst({
+      where: { id: requestedProjectId, workspace_id: workspaceId, status: 'active' },
+      select: { id: true },
+    })
     if (project) return project.id
   }
 
-  const fallback = db.prepare(`
-    SELECT id FROM projects
-    WHERE workspace_id = ? AND status = 'active'
-    ORDER BY CASE WHEN slug = 'general' THEN 0 ELSE 1 END, id ASC
-    LIMIT 1
-  `).get(workspaceId) as { id: number } | undefined
+  // Legacy ordering: "general" first, otherwise first by id.
+  const general = await prisma.projects.findFirst({
+    where: { workspace_id: workspaceId, status: 'active', slug: 'general' },
+    select: { id: true },
+    orderBy: { id: 'asc' },
+  })
+  if (general) return general.id
 
-  if (!fallback) {
-    throw new Error('No active project available in workspace')
-  }
+  const fallback = await prisma.projects.findFirst({
+    where: { workspace_id: workspaceId, status: 'active' },
+    select: { id: true },
+    orderBy: { id: 'asc' },
+  })
+  if (!fallback) throw new Error('No active project available in workspace')
   return fallback.id
 }
 
-function hasAegisApproval(db: ReturnType<typeof getDatabase>, taskId: number, workspaceId: number): boolean {
-  const review = db.prepare(`
-    SELECT status FROM quality_reviews
-    WHERE task_id = ? AND reviewer = 'aegis' AND workspace_id = ?
-    ORDER BY created_at DESC
-    LIMIT 1
-  `).get(taskId, workspaceId) as { status?: string } | undefined
+async function hasAegisApproval(
+  prisma: ReturnType<typeof getPrismaClient>,
+  taskId: number,
+  workspaceId: number
+): Promise<boolean> {
+  const review = await prisma.quality_reviews.findFirst({
+    where: { task_id: taskId, reviewer: 'aegis', workspace_id: workspaceId },
+    select: { status: true },
+    orderBy: { created_at: 'desc' },
+  })
   return review?.status === 'approved'
 }
 
@@ -61,11 +72,11 @@ function hasAegisApproval(db: ReturnType<typeof getDatabase>, taskId: number, wo
  * Query params: status, assigned_to, priority, project_id, limit, offset
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer');
+  const auth = await requireRole(request, 'viewer');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const workspaceId = auth.user.workspace_id;
     const { searchParams } = new URL(request.url);
 
@@ -77,67 +88,48 @@ export async function GET(request: NextRequest) {
     const limit = Math.min(parseInt(searchParams.get('limit') || '50'), 200);
     const offset = parseInt(searchParams.get('offset') || '0');
     
-    // Build dynamic query
-    let query = `
-      SELECT t.*, p.name as project_name, p.ticket_prefix as project_prefix
-      FROM tasks t
-      LEFT JOIN projects p
-        ON p.id = t.project_id AND p.workspace_id = t.workspace_id
-      WHERE t.workspace_id = ?
-    `;
-    const params: any[] = [workspaceId];
-    
-    if (status) {
-      query += ' AND t.status = ?';
-      params.push(status);
-    }
-    
-    if (assigned_to) {
-      query += ' AND t.assigned_to = ?';
-      params.push(assigned_to);
-    }
-    
-    if (priority) {
-      query += ' AND t.priority = ?';
-      params.push(priority);
+    const where: any = {
+      workspace_id: workspaceId,
+      ...(status ? { status } : {}),
+      ...(assigned_to ? { assigned_to } : {}),
+      ...(priority ? { priority } : {}),
+      ...(Number.isFinite(projectIdParam) ? { project_id: projectIdParam } : {}),
     }
 
-    if (Number.isFinite(projectIdParam)) {
-      query += ' AND t.project_id = ?';
-      params.push(projectIdParam);
-    }
-    
-    query += ' ORDER BY t.created_at DESC LIMIT ? OFFSET ?';
-    params.push(limit, offset);
-    
-    const stmt = db.prepare(query);
-    const tasks = stmt.all(...params) as Task[];
-    
-    // Parse JSON fields
-    const tasksWithParsedData = tasks.map(mapTaskRow);
-    
-    // Get total count for pagination
-    let countQuery = 'SELECT COUNT(*) as total FROM tasks WHERE workspace_id = ?';
-    const countParams: any[] = [workspaceId];
-    if (status) {
-      countQuery += ' AND status = ?';
-      countParams.push(status);
-    }
-    if (assigned_to) {
-      countQuery += ' AND assigned_to = ?';
-      countParams.push(assigned_to);
-    }
-    if (priority) {
-      countQuery += ' AND priority = ?';
-      countParams.push(priority);
-    }
-    if (Number.isFinite(projectIdParam)) {
-      countQuery += ' AND project_id = ?';
-      countParams.push(projectIdParam);
-    }
-    const countRow = db.prepare(countQuery).get(...countParams) as { total: number };
+    const [rows, total] = await Promise.all([
+      prisma.tasks.findMany({
+        where,
+        orderBy: { created_at: 'desc' },
+        take: limit,
+        skip: offset,
+      }),
+      prisma.tasks.count({ where }),
+    ])
 
-    return NextResponse.json({ tasks: tasksWithParsedData, total: countRow.total, page: Math.floor(offset / limit) + 1, limit });
+    const projectIds = Array.from(new Set(rows.map((t) => t.project_id).filter((id): id is number => typeof id === 'number')))
+    const projects = projectIds.length
+      ? await prisma.projects.findMany({
+          where: { id: { in: projectIds }, workspace_id: workspaceId },
+          select: { id: true, name: true, ticket_prefix: true },
+        })
+      : []
+    const projectById = new Map(projects.map((p) => [p.id, p]))
+
+    const tasksWithParsedData = rows.map((t) => {
+      const proj = typeof t.project_id === 'number' ? projectById.get(t.project_id) : undefined
+      return mapTaskRow({
+        ...(t as any),
+        project_name: proj?.name ?? null,
+        project_prefix: proj?.ticket_prefix ?? null,
+      })
+    })
+
+    return NextResponse.json({
+      tasks: tasksWithParsedData,
+      total,
+      page: Math.floor(offset / limit) + 1,
+      limit,
+    });
   } catch (error) {
     logger.error({ err: error }, 'GET /api/tasks error');
     return NextResponse.json({ error: 'Failed to fetch tasks' }, { status: 500 });
@@ -148,14 +140,14 @@ export async function GET(request: NextRequest) {
  * POST /api/tasks - Create a new task
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator');
+  const auth = await requireRole(request, 'operator');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   const rateCheck = mutationLimiter(request);
   if (rateCheck) return rateCheck;
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const workspaceId = auth.user.workspace_id;
     const validated = await validateBody(request, createTaskSchema);
     if ('error' in validated) return validated.error;
@@ -184,15 +176,12 @@ export async function POST(request: NextRequest) {
       metadata = {}
     } = body;
     const normalizedStatus = normalizeTaskCreateStatus(status, assigned_to)
-    
-    // Check for duplicate title
-    const existingTask = db.prepare('SELECT id FROM tasks WHERE title = ? AND workspace_id = ?').get(title, workspaceId);
-    if (existingTask) {
-      return NextResponse.json({ error: 'Task with this title already exists' }, { status: 409 });
-    }
+
+    // Resolve project_id for the task
+    const resolvedProjectId = await resolveProjectId(prisma, workspaceId, project_id)
     
     const now = Math.floor(Date.now() / 1000);
-    const mentionResolution = resolveMentionRecipients(description || '', db, workspaceId);
+    const mentionResolution = await resolveMentionRecipientsAsync(description || '', workspaceId);
     if (mentionResolution.unresolved.length > 0) {
       return NextResponse.json({
         error: `Unknown mentions: ${mentionResolution.unresolved.map((m) => `@${m}`).join(', ')}`,
@@ -202,57 +191,44 @@ export async function POST(request: NextRequest) {
 
     const resolvedCompletedAt = completed_at ?? (normalizedStatus === 'done' ? now : null)
 
-    const createTaskTx = db.transaction(() => {
-      const resolvedProjectId = resolveProjectId(db, workspaceId, project_id)
-      db.prepare(`
-        UPDATE projects
-        SET ticket_counter = ticket_counter + 1, updated_at = unixepoch()
-        WHERE id = ? AND workspace_id = ?
-      `).run(resolvedProjectId, workspaceId)
-      const row = db.prepare(`
-        SELECT ticket_counter FROM projects
-        WHERE id = ? AND workspace_id = ?
-      `).get(resolvedProjectId, workspaceId) as { ticket_counter: number } | undefined
-      if (!row || !row.ticket_counter) throw new Error('Failed to allocate project ticket number')
+    const taskId = await prisma.$transaction(async (tx) => {
+      const project = await tx.projects.update({
+        where: { id: resolvedProjectId },
+        data: { ticket_counter: { increment: 1 }, updated_at: now },
+        select: { ticket_counter: true },
+      })
+      if (!project?.ticket_counter) throw new Error('Failed to allocate project ticket number')
 
-      const insertStmt = db.prepare(`
-        INSERT INTO tasks (
-          title, description, status, priority, project_id, project_ticket_no, assigned_to, created_by,
-          created_at, updated_at, due_date, estimated_hours, actual_hours,
-          outcome, error_message, resolution, feedback_rating, feedback_notes, retry_count, completed_at,
-          tags, metadata, workspace_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `)
-
-      const dbResult = insertStmt.run(
-        title,
-        description,
-        normalizedStatus,
-        priority,
-        resolvedProjectId,
-        row.ticket_counter,
-        assigned_to,
-        actor,
-        now,
-        now,
-        due_date,
-        estimated_hours,
-        actual_hours,
-        outcome,
-        error_message,
-        resolution,
-        feedback_rating,
-        feedback_notes,
-        retry_count,
-        resolvedCompletedAt,
-        JSON.stringify(tags),
-        JSON.stringify(metadata),
-        workspaceId
-      )
-      return Number(dbResult.lastInsertRowid)
+      const created = await tx.tasks.create({
+        data: {
+          title,
+          description: description ?? null,
+          status: normalizedStatus,
+          priority,
+          project_id: resolvedProjectId,
+          project_ticket_no: project.ticket_counter,
+          assigned_to: assigned_to ?? null,
+          created_by: actor,
+          created_at: now,
+          updated_at: now,
+          due_date: due_date ?? null,
+          estimated_hours: estimated_hours ?? null,
+          actual_hours: actual_hours ?? null,
+          outcome: outcome ?? null,
+          error_message: error_message ?? null,
+          resolution: resolution ?? null,
+          feedback_rating: feedback_rating ?? null,
+          feedback_notes: feedback_notes ?? null,
+          retry_count: retry_count ?? 0,
+          completed_at: resolvedCompletedAt,
+          tags: JSON.stringify(tags ?? []),
+          metadata: JSON.stringify(metadata ?? {}),
+          workspace_id: workspaceId,
+        } as any,
+        select: { id: true },
+      })
+      return created.id
     })
-
-    const taskId = createTaskTx()
     
     // Log activity
     db_helpers.logActivity('task_created', 'task', taskId, actor, `Created task: ${title}`, {
@@ -296,26 +272,27 @@ export async function POST(request: NextRequest) {
     }
     
     // Fetch the created task
-    const createdTask = db.prepare(`
-      SELECT t.*, p.name as project_name, p.ticket_prefix as project_prefix
-      FROM tasks t
-      LEFT JOIN projects p
-        ON p.id = t.project_id AND p.workspace_id = t.workspace_id
-      WHERE t.id = ? AND t.workspace_id = ?
-    `).get(taskId, workspaceId) as Task;
-    const parsedTask = mapTaskRow(createdTask);
+    const createdTask = await prisma.tasks.findFirst({
+      where: { id: taskId, workspace_id: workspaceId },
+    })
+    if (!createdTask) throw new Error('Created task not found')
+    const project = createdTask.project_id
+      ? await prisma.projects.findFirst({
+          where: { id: createdTask.project_id, workspace_id: workspaceId },
+          select: { name: true, ticket_prefix: true, github_repo: true, github_sync_enabled: true, id: true },
+        })
+      : null
+    const parsedTask = mapTaskRow({
+      ...(createdTask as any),
+      project_name: project?.name ?? null,
+      project_prefix: project?.ticket_prefix ?? null,
+    });
 
     // Fire-and-forget outbound GitHub sync for new tasks
-    if (parsedTask.project_id) {
-      const project = db.prepare(`
-        SELECT id, github_repo, github_sync_enabled FROM projects
-        WHERE id = ? AND workspace_id = ?
-      `).get(parsedTask.project_id, workspaceId) as any
-      if (project?.github_sync_enabled && project?.github_repo) {
-        pushTaskToGitHub(parsedTask as any, project).catch(err =>
-          logger.error({ err, taskId }, 'Outbound GitHub sync failed for new task')
-        )
-      }
+    if (project?.github_sync_enabled && project?.github_repo) {
+      pushTaskToGitHub(parsedTask as any, project as any).catch((err) =>
+        logger.error({ err, taskId }, 'Outbound GitHub sync failed for new task')
+      )
     }
 
     // Broadcast to SSE clients
@@ -332,14 +309,14 @@ export async function POST(request: NextRequest) {
  * PUT /api/tasks - Update multiple tasks (for drag-and-drop status changes)
  */
 export async function PUT(request: NextRequest) {
-  const auth = requireRole(request, 'operator');
+  const auth = await requireRole(request, 'operator');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   const rateCheck = mutationLimiter(request);
   if (rateCheck) return rateCheck;
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const workspaceId = auth.user.workspace_id;
     const validated = await validateBody(request, bulkUpdateTaskStatusSchema);
     if ('error' in validated) return validated.error;
@@ -347,50 +324,52 @@ export async function PUT(request: NextRequest) {
 
     const now = Math.floor(Date.now() / 1000);
 
-    const updateStmt = db.prepare(`
-      UPDATE tasks
-      SET status = ?, updated_at = ?
-      WHERE id = ? AND workspace_id = ?
-    `);
-    const updateDoneStmt = db.prepare(`
-      UPDATE tasks
-      SET status = ?, updated_at = ?, completed_at = COALESCE(completed_at, ?)
-      WHERE id = ? AND workspace_id = ?
-    `);
-
     const actor = auth.user.username
 
-    const transaction = db.transaction((tasksToUpdate: any[]) => {
-      for (const task of tasksToUpdate) {
-        const oldTask = db.prepare('SELECT * FROM tasks WHERE id = ? AND workspace_id = ?').get(task.id, workspaceId) as Task;
-        if (!oldTask) continue;
+    const ids = Array.from(new Set(tasks.map((t: any) => Number(t.id)).filter((id: number) => Number.isFinite(id))))
+    const oldTasks = ids.length
+      ? await prisma.tasks.findMany({
+          where: { id: { in: ids }, workspace_id: workspaceId },
+          select: { id: true, status: true, completed_at: true },
+        })
+      : []
+    const oldById = new Map(oldTasks.map((t) => [t.id, t]))
 
-        if (task.status === 'done' && !hasAegisApproval(db, task.id, workspaceId)) {
-          throw new Error(`Aegis approval required for task ${task.id}`)
-        }
+    await prisma.$transaction(async (tx) => {
+      for (const task of tasks as any[]) {
+        const taskId = Number(task.id)
+        if (!Number.isFinite(taskId)) continue
+        const oldTask = oldById.get(taskId)
+        if (!oldTask) continue
 
         if (task.status === 'done') {
-          updateDoneStmt.run(task.status, now, now, task.id, workspaceId);
-        } else {
-          updateStmt.run(task.status, now, task.id, workspaceId);
+          const approved = await hasAegisApproval(tx as any, taskId, workspaceId)
+          if (!approved) throw new Error(`Aegis approval required for task ${taskId}`)
         }
 
-        // Log status change if different
-        if (oldTask && oldTask.status !== task.status) {
+        const completedAt = task.status === 'done' ? (oldTask.completed_at ?? now) : oldTask.completed_at
+        await tx.tasks.updateMany({
+          where: { id: taskId, workspace_id: workspaceId },
+          data: {
+            status: task.status,
+            updated_at: now,
+            ...(task.status === 'done' ? { completed_at: completedAt } : {}),
+          } as any,
+        })
+
+        if (oldTask.status !== task.status) {
           db_helpers.logActivity(
             'task_updated',
             'task',
-            task.id,
+            taskId,
             actor,
             `Task moved from ${oldTask.status} to ${task.status}`,
             { oldStatus: oldTask.status, newStatus: task.status },
             workspaceId
-          );
+          )
         }
       }
-    });
-    
-    transaction(tasks);
+    })
 
     // Broadcast status changes to SSE clients
     for (const task of tasks) {

@@ -1,4 +1,5 @@
 import type { Database } from 'better-sqlite3'
+import { getPrismaClient } from '@/lib/prisma'
 
 export interface MentionTarget {
   handle: string
@@ -106,6 +107,77 @@ export function getMentionTargets(db: Database, workspaceId: number): MentionTar
   return targets
 }
 
+export async function getMentionTargetsAsync(workspaceId: number): Promise<MentionTarget[]> {
+  const prisma = getPrismaClient()
+  const targets: MentionTarget[] = []
+  const seenHandles = new Set<string>()
+
+  const users = await prisma.users.findMany({
+    where: { workspace_id: workspaceId },
+    select: { username: true, display_name: true },
+  })
+
+  // Match legacy `ORDER BY username ASC` and tolerate case differences.
+  const usersSorted = [...users].sort((a, b) =>
+    String(a.username).localeCompare(String(b.username), undefined, { sensitivity: 'base' })
+  )
+  for (const user of usersSorted) {
+    const username = String(user.username || '').trim()
+    if (!username) continue
+    const handle = username.toLowerCase()
+    if (seenHandles.has(handle)) continue
+    seenHandles.add(handle)
+    targets.push({
+      handle,
+      recipient: username,
+      type: 'user',
+      display: user.display_name?.trim() || username,
+    })
+  }
+
+  const agents = await prisma.agents.findMany({
+    where: { workspace_id: workspaceId },
+    select: { name: true, role: true, config: true },
+  })
+  const agentsSorted = [...agents].sort((a, b) =>
+    String(a.name).localeCompare(String(b.name), undefined, { sensitivity: 'base' })
+  )
+
+  for (const agent of agentsSorted) {
+    const recipient = String(agent.name || '').trim()
+    if (!recipient) continue
+
+    let openclawId: string | null = null
+    try {
+      const parsed = agent.config ? JSON.parse(agent.config) : null
+      if (parsed && typeof parsed.openclawId === 'string' && parsed.openclawId.trim()) {
+        openclawId = parsed.openclawId.trim()
+      }
+    } catch {
+      // ignore invalid config JSON for mention indexing
+    }
+
+    const candidateHandles = [openclawId, normalizeAgentHandle(recipient), recipient.toLowerCase()].filter(
+      (value): value is string => Boolean(value)
+    )
+
+    for (const rawHandle of candidateHandles) {
+      const handle = rawHandle.toLowerCase()
+      if (!handle || seenHandles.has(handle)) continue
+      seenHandles.add(handle)
+      targets.push({
+        handle,
+        recipient,
+        type: 'agent',
+        display: recipient,
+        role: agent.role || undefined,
+      })
+    }
+  }
+
+  return targets
+}
+
 export function resolveMentionRecipients(text: string, db: Database, workspaceId: number): MentionResolution {
   const tokens = parseMentions(text)
   if (tokens.length === 0) {
@@ -113,6 +185,43 @@ export function resolveMentionRecipients(text: string, db: Database, workspaceId
   }
 
   const targets = getMentionTargets(db, workspaceId)
+  const byHandle = new Map<string, MentionTarget>()
+  for (const target of targets) {
+    byHandle.set(target.handle.toLowerCase(), target)
+  }
+
+  const resolved: MentionTarget[] = []
+  const unresolved: string[] = []
+  const recipientSeen = new Set<string>()
+
+  for (const token of tokens) {
+    const key = token.toLowerCase()
+    const target = byHandle.get(key)
+    if (!target) {
+      unresolved.push(token)
+      continue
+    }
+    if (!recipientSeen.has(target.recipient)) {
+      recipientSeen.add(target.recipient)
+      resolved.push(target)
+    }
+  }
+
+  return {
+    tokens,
+    unresolved,
+    recipients: resolved.map((item) => item.recipient),
+    resolved,
+  }
+}
+
+export async function resolveMentionRecipientsAsync(text: string, workspaceId: number): Promise<MentionResolution> {
+  const tokens = parseMentions(text)
+  if (tokens.length === 0) {
+    return { tokens: [], unresolved: [], recipients: [], resolved: [] }
+  }
+
+  const targets = await getMentionTargetsAsync(workspaceId)
   const byHandle = new Map<string, MentionTarget>()
   for (const target of targets) {
     byHandle.set(target.handle.toLowerCase(), target)

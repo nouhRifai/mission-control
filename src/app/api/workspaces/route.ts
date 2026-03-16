@@ -1,17 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
-import { getDatabase, logAuditEvent } from '@/lib/db'
-import { listWorkspacesForTenant } from '@/lib/workspaces'
+import { logAuditEvent } from '@/lib/db'
+import { listWorkspacesForTenantAsync } from '@/lib/workspaces'
 import { logger } from '@/lib/logger'
+import { getPrismaClient } from '@/lib/prisma'
 
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
     const tenantId = auth.user.tenant_id ?? 1
-    const workspaces = listWorkspacesForTenant(db, tenantId)
+    const workspaces = await listWorkspacesForTenantAsync(tenantId)
     return NextResponse.json({
       workspaces,
       active_workspace_id: auth.user.workspace_id,
@@ -26,11 +26,11 @@ export async function GET(request: NextRequest) {
  * POST /api/workspaces - Create a new workspace
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const tenantId = auth.user.tenant_id ?? 1
     const body = await request.json()
     const { name, slug } = body
@@ -48,25 +48,31 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid slug' }, { status: 400 })
     }
 
-    // Check uniqueness
-    const existing = db.prepare('SELECT id FROM workspaces WHERE slug = ?').get(resolvedSlug)
-    if (existing) {
-      return NextResponse.json({ error: 'Workspace slug already exists' }, { status: 409 })
-    }
-
     const now = Math.floor(Date.now() / 1000)
-    const result = db.prepare(
-      'INSERT INTO workspaces (slug, name, tenant_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)'
-    ).run(resolvedSlug, name.trim(), tenantId, now, now)
-
-    const workspace = db.prepare('SELECT * FROM workspaces WHERE id = ?').get(result.lastInsertRowid)
+    let workspace: any
+    try {
+      workspace = await prisma.workspaces.create({
+        data: {
+          slug: resolvedSlug,
+          name: name.trim(),
+          tenant_id: tenantId,
+          created_at: now,
+          updated_at: now,
+        },
+      })
+    } catch (err: any) {
+      if (err?.code === 'P2002') {
+        return NextResponse.json({ error: 'Workspace slug already exists' }, { status: 409 })
+      }
+      throw err
+    }
 
     logAuditEvent({
       action: 'workspace_created',
       actor: auth.user.username,
       actor_id: auth.user.id,
       target_type: 'workspace',
-      target_id: Number(result.lastInsertRowid),
+      target_id: Number(workspace.id),
       detail: { name: name.trim(), slug: resolvedSlug },
     })
 

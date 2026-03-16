@@ -14,13 +14,13 @@ const INSECURE_PASSWORDS = new Set([
 ])
 
 export async function GET() {
-  return NextResponse.json({ needsSetup: needsFirstTimeSetup() })
+  return NextResponse.json({ needsSetup: await needsFirstTimeSetup() })
 }
 
 export async function POST(request: Request) {
   try {
     // Only allow setup when no users exist
-    if (!needsFirstTimeSetup()) {
+    if (!(await needsFirstTimeSetup())) {
       return NextResponse.json(
         { error: 'Setup has already been completed' },
         { status: 403 }
@@ -61,7 +61,7 @@ export async function POST(request: Request) {
     }
 
     // Double-check no users exist (race safety — createUser will also fail on duplicate username)
-    if (!needsFirstTimeSetup()) {
+    if (!(await needsFirstTimeSetup())) {
       return NextResponse.json(
         { error: 'Another admin was created while you were setting up' },
         { status: 409 }
@@ -71,7 +71,7 @@ export async function POST(request: Request) {
     const resolvedDisplayName = displayName?.trim() ||
       trimmedUsername.charAt(0).toUpperCase() + trimmedUsername.slice(1)
 
-    const user = createUser(trimmedUsername, password, resolvedDisplayName, 'admin')
+    const user = await createUser(trimmedUsername, password, resolvedDisplayName, 'admin')
 
     const ipAddress = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown'
     const userAgent = request.headers.get('user-agent') || undefined
@@ -87,7 +87,7 @@ export async function POST(request: Request) {
     logger.info(`First-time setup: admin user "${user.username}" created`)
 
     // Auto-login: create session and set cookie
-    const { token, expiresAt } = createSession(user.id, ipAddress, userAgent, user.workspace_id)
+    const { token, expiresAt } = await createSession(user.id, ipAddress, userAgent, user.workspace_id)
 
     const response = NextResponse.json({
       user: {

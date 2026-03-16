@@ -10,7 +10,7 @@ import {
 } from '@/lib/agent-optimizer'
 
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = readLimiter(request)
@@ -26,10 +26,12 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Missing required parameter: agent' }, { status: 400 })
     }
 
-    const efficiency = analyzeTokenEfficiency(agent, hours, workspaceId)
-    const toolPatterns = analyzeToolPatterns(agent, hours, workspaceId)
-    const fleet = getFleetBenchmarks(workspaceId)
-    const recommendations = generateRecommendations(agent, workspaceId)
+    const [efficiency, toolPatterns, fleet, recommendations] = await Promise.all([
+      analyzeTokenEfficiency(agent, hours, workspaceId),
+      analyzeToolPatterns(agent, hours, workspaceId),
+      getFleetBenchmarks(workspaceId),
+      generateRecommendations(agent, workspaceId),
+    ])
 
     // Calculate fleet percentile for tokens per session
     const fleetTokens = fleet

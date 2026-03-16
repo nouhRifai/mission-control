@@ -7,9 +7,10 @@
  * date-suffixed titles.
  */
 
-import { getDatabase, db_helpers } from './db'
+import { db_helpers } from './db'
 import { logger } from './logger'
 import { isCronDue } from './schedule-parser'
+import { getPrismaClient } from './prisma'
 
 export interface RecurrenceMetadata {
   cron_expr: string
@@ -28,30 +29,39 @@ function formatDateSuffix(): string {
 
 export async function spawnRecurringTasks(): Promise<{ ok: boolean; message: string }> {
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const nowMs = Date.now()
     const nowSec = Math.floor(nowMs / 1000)
 
-    // Find all template tasks with enabled recurrence
-    const templates = db.prepare(`
-      SELECT id, title, description, priority, project_id, assigned_to, created_by,
-             tags, metadata, workspace_id
-      FROM tasks
-      WHERE json_extract(metadata, '$.recurrence.enabled') = 1
-        AND json_extract(metadata, '$.recurrence.cron_expr') IS NOT NULL
-        AND json_extract(metadata, '$.recurrence.parent_task_id') IS NULL
-    `).all() as Array<{
-      id: number
-      title: string
-      description: string | null
-      priority: string
-      project_id: number | null
-      assigned_to: string | null
-      created_by: string
-      tags: string | null
-      metadata: string | null
-      workspace_id: number
-    }>
+    // Find all template tasks with enabled recurrence (metadata JSON).
+    // We avoid provider-specific JSON-path SQL by filtering + parsing in application code.
+    const candidates = await prisma.tasks.findMany({
+      where: {
+        metadata: { not: null, contains: '"recurrence"' },
+      },
+      select: {
+        id: true,
+        title: true,
+        description: true,
+        priority: true,
+        project_id: true,
+        assigned_to: true,
+        created_by: true,
+        tags: true,
+        metadata: true,
+        workspace_id: true,
+      },
+    }) as any[]
+
+    const templates = candidates.filter((row) => {
+      try {
+        const metadata = row.metadata ? JSON.parse(row.metadata) : {}
+        const recurrence = metadata.recurrence as RecurrenceMetadata | undefined
+        return Boolean(recurrence?.enabled && recurrence.cron_expr && recurrence.parent_task_id == null)
+      } catch {
+        return false
+      }
+    })
 
     if (templates.length === 0) {
       return { ok: true, message: 'No recurring tasks' }
@@ -71,12 +81,11 @@ export async function spawnRecurringTasks(): Promise<{ ok: boolean; message: str
       const dateSuffix = formatDateSuffix()
       const childTitle = `${template.title} - ${dateSuffix}`
 
-      // Duplicate prevention: check if a child with this exact title already exists
-      const existing = db.prepare(`
-        SELECT id FROM tasks
-        WHERE title = ? AND workspace_id = ?
-        LIMIT 1
-      `).get(childTitle, template.workspace_id)
+      // Duplicate prevention: check if a child with this exact title already exists in the same project
+      const existing = await prisma.tasks.findFirst({
+        where: { title: childTitle, workspace_id: template.workspace_id, project_id: template.project_id },
+        select: { id: true },
+      })
       if (existing) continue
 
       // Spawn child task
@@ -87,65 +96,60 @@ export async function spawnRecurringTasks(): Promise<{ ok: boolean; message: str
         },
       }
 
-      db.transaction(() => {
-        // Get project ticket number
-        if (template.project_id) {
-          db.prepare(`
-            UPDATE projects
-            SET ticket_counter = ticket_counter + 1, updated_at = unixepoch()
-            WHERE id = ? AND workspace_id = ?
-          `).run(template.project_id, template.workspace_id)
-        }
+      const childId = await prisma.$transaction(async (tx) => {
+        // Get project ticket number (if project-scoped).
+        const ticketNo = template.project_id
+          ? (await tx.projects.update({
+              where: { id: template.project_id },
+              data: { ticket_counter: { increment: 1 }, updated_at: nowSec },
+              select: { ticket_counter: true },
+            })).ticket_counter
+          : null
 
-        const ticketRow = template.project_id
-          ? db.prepare(`SELECT ticket_counter FROM projects WHERE id = ? AND workspace_id = ?`).get(template.project_id, template.workspace_id) as { ticket_counter: number } | undefined
-          : undefined
+        const created = await tx.tasks.create({
+          data: {
+            title: childTitle,
+            description: template.description,
+            status: template.assigned_to ? 'assigned' : 'inbox',
+            priority: template.priority,
+            project_id: template.project_id,
+            project_ticket_no: ticketNo,
+            assigned_to: template.assigned_to,
+            created_by: 'scheduler',
+            created_at: nowSec,
+            updated_at: nowSec,
+            tags: template.tags,
+            metadata: JSON.stringify(childMetadata),
+            workspace_id: template.workspace_id,
+          },
+          select: { id: true },
+        })
 
-        const insertResult = db.prepare(`
-          INSERT INTO tasks (
-            title, description, status, priority, project_id, project_ticket_no,
-            assigned_to, created_by, created_at, updated_at,
-            tags, metadata, workspace_id
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
-          childTitle,
-          template.description,
-          template.assigned_to ? 'assigned' : 'inbox',
-          template.priority,
-          template.project_id,
-          ticketRow?.ticket_counter ?? null,
-          template.assigned_to,
-          'scheduler',
-          nowSec,
-          nowSec,
-          template.tags,
-          JSON.stringify(childMetadata),
-          template.workspace_id,
-        )
-
-        const childId = Number(insertResult.lastInsertRowid)
-
-        // Update template: bump spawn count and last_spawned_at
+        // Update template: bump spawn count and last_spawned_at.
         const updatedRecurrence = {
           ...recurrence,
           last_spawned_at: nowSec,
           spawn_count: (recurrence.spawn_count || 0) + 1,
         }
         const updatedMetadata = { ...metadata, recurrence: updatedRecurrence }
-        db.prepare(`
-          UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?
-        `).run(JSON.stringify(updatedMetadata), nowSec, template.id)
+        await tx.tasks.update({
+          where: { id: template.id },
+          data: { metadata: JSON.stringify(updatedMetadata), updated_at: nowSec },
+          select: { id: true },
+        })
 
-        db_helpers.logActivity(
-          'task_created',
-          'task',
-          childId,
-          'scheduler',
-          `Recurring task spawned: ${childTitle}`,
-          { parent_task_id: template.id, cron_expr: recurrence.cron_expr },
-          template.workspace_id,
-        )
-      })()
+        return created.id
+      })
+
+      db_helpers.logActivity(
+        'task_created',
+        'task',
+        childId,
+        'scheduler',
+        `Recurring task spawned: ${childTitle}`,
+        { parent_task_id: template.id, cron_expr: recurrence.cron_expr },
+        template.workspace_id,
+      )
 
       spawned++
     }

@@ -1,6 +1,10 @@
 import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react'
 
+// Ensure test workers inherit a stable default DB provider, even if the host shell
+// has `MISSION_CONTROL_DB_PROVIDER=postgres` set.
+process.env.MISSION_CONTROL_DB_PROVIDER = 'sqlite'
+
 export default defineConfig(async () => {
   // `vite-tsconfig-paths` is ESM-only; loading it via dynamic import avoids
   // Vite's config bundler trying to `require()` it.
@@ -8,12 +12,17 @@ export default defineConfig(async () => {
 
   return {
     plugins: [react(), tsconfigPaths()],
-    test: {
-      environment: 'jsdom',
-      globals: true,
-      setupFiles: ['src/test/setup.ts'],
-      include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
-      coverage: {
+	    test: {
+	      environment: 'jsdom',
+	      globals: true,
+	      env: {
+	        // Default the unit test environment to the legacy SQLite provider.
+	        // Postgres-specific tests should override env and reset modules.
+	        MISSION_CONTROL_DB_PROVIDER: 'sqlite',
+	      },
+	      setupFiles: ['src/test/setup.ts'],
+	      include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
+	      coverage: {
         provider: 'v8' as const,
         include: ['src/lib/**/*.ts'],
         exclude: [

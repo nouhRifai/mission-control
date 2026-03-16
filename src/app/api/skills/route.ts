@@ -7,6 +7,7 @@ import { homedir } from 'node:os'
 import { requireRole } from '@/lib/auth'
 import { resolveWithin } from '@/lib/paths'
 import { checkSkillSecurity } from '@/lib/skill-registry'
+import { getPrismaClient } from '@/lib/prisma'
 
 interface SkillSummary {
   id: string
@@ -112,29 +113,30 @@ async function upsertSkill(root: SkillRoot, name: string, content: string) {
 
   // Update DB hash so next sync cycle detects our write
   try {
-    const { getDatabase } = await import('@/lib/db')
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const hash = createHash('sha256').update(content, 'utf8').digest('hex')
     const now = new Date().toISOString()
     const descLines = content.split('\n').map(l => l.trim()).filter(Boolean)
     const desc = descLines.find(l => !l.startsWith('#'))
-    db.prepare(`
-      INSERT INTO skills (name, source, path, description, content_hash, installed_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(source, name) DO UPDATE SET
-        path = excluded.path,
-        description = excluded.description,
-        content_hash = excluded.content_hash,
-        updated_at = excluded.updated_at
-    `).run(
-      name,
-      root.source,
-      skillPath,
-      desc ? (desc.length > 220 ? `${desc.slice(0, 217)}...` : desc) : null,
-      hash,
-      now,
-      now
-    )
+    const description = desc ? (desc.length > 220 ? `${desc.slice(0, 217)}...` : desc) : null
+    await prisma.skills.upsert({
+      where: { source_name: { source: root.source, name } },
+      create: {
+        name,
+        source: root.source,
+        path: skillPath,
+        description,
+        content_hash: hash,
+        installed_at: now,
+        updated_at: now,
+      } as any,
+      update: {
+        path: skillPath,
+        description,
+        content_hash: hash,
+        updated_at: now,
+      } as any,
+    })
   } catch { /* DB not ready yet — sync will catch it */ }
 
   return { skillPath, skillDocPath }
@@ -146,9 +148,8 @@ async function deleteSkill(root: SkillRoot, name: string) {
 
   // Remove from DB
   try {
-    const { getDatabase } = await import('@/lib/db')
-    const db = getDatabase()
-    db.prepare('DELETE FROM skills WHERE source = ? AND name = ?').run(root.source, name)
+    const prisma = getPrismaClient()
+    await prisma.skills.deleteMany({ where: { source: root.source, name } })
   } catch { /* best-effort */ }
 
   return { skillPath }
@@ -158,13 +159,13 @@ async function deleteSkill(root: SkillRoot, name: string) {
  * Try to serve skill list from DB (fast path).
  * Falls back to filesystem scan if DB has no data yet.
  */
-function getSkillsFromDB(): SkillSummary[] | null {
+async function getSkillsFromDB(): Promise<SkillSummary[] | null> {
   try {
-    const { getDatabase } = require('@/lib/db')
-    const db = getDatabase()
-    const rows = db.prepare('SELECT name, source, path, description, registry_slug, security_status FROM skills ORDER BY name').all() as Array<{
-      name: string; source: string; path: string; description: string | null; registry_slug: string | null; security_status: string | null
-    }>
+    const prisma = getPrismaClient()
+    const rows = await prisma.skills.findMany({
+      orderBy: { name: 'asc' },
+      select: { name: true, source: true, path: true, description: true, registry_slug: true, security_status: true },
+    })
     if (rows.length === 0) return null // DB empty — fall back to fs scan
     return rows.map(r => ({
       id: `${r.source}:${r.name}`,
@@ -181,7 +182,7 @@ function getSkillsFromDB(): SkillSummary[] | null {
 }
 
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const roots = getSkillRoots()
@@ -235,17 +236,18 @@ export async function GET(request: NextRequest) {
 
     // Update DB with security status
     try {
-      const { getDatabase } = await import('@/lib/db')
-      const db = getDatabase()
-      db.prepare('UPDATE skills SET security_status = ?, updated_at = ? WHERE source = ? AND name = ?')
-        .run(security.status, new Date().toISOString(), source, name)
+      const prisma = getPrismaClient()
+      await prisma.skills.updateMany({
+        where: { source, name },
+        data: { security_status: security.status, updated_at: new Date().toISOString() },
+      })
     } catch { /* best-effort */ }
 
     return NextResponse.json({ source, name, security })
   }
 
   // Try DB-backed fast path first
-  const dbSkills = getSkillsFromDB()
+  const dbSkills = await getSkillsFromDB()
   if (dbSkills) {
     // Group by source for the groups response
     const groupMap = new Map<string, { source: string; path: string; skills: SkillSummary[] }>()
@@ -292,7 +294,7 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const roots = getSkillRoots()
@@ -312,7 +314,7 @@ export async function POST(request: NextRequest) {
 }
 
 export async function PUT(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const roots = getSkillRoots()
@@ -331,7 +333,7 @@ export async function PUT(request: NextRequest) {
 }
 
 export async function DELETE(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const { searchParams } = new URL(request.url)

@@ -3,9 +3,9 @@
  * Lazy singleton — call startSyncPoller() to begin.
  */
 
-import { getDatabase } from '@/lib/db'
 import { logger } from '@/lib/logger'
 import { pullFromGitHub } from '@/lib/github-sync-engine'
+import { getPrismaClient } from '@/lib/prisma'
 
 const INTERVAL_MS = parseInt(process.env.GITHUB_SYNC_INTERVAL_MS || '60000', 10)
 
@@ -43,19 +43,22 @@ export function getSyncPollerStatus(): { running: boolean; interval: number; las
 
 async function runSyncTick(): Promise<void> {
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
 
-    const projects = db.prepare(`
-      SELECT id, github_repo, github_sync_enabled, github_default_branch, workspace_id
-      FROM projects
-      WHERE github_sync_enabled = 1 AND github_repo IS NOT NULL AND status = 'active'
-    `).all() as Array<{
-      id: number
-      github_repo: string
-      github_sync_enabled: number
-      github_default_branch: string | null
-      workspace_id: number
-    }>
+    const projects = await prisma.projects.findMany({
+      where: {
+        github_sync_enabled: 1,
+        github_repo: { not: null },
+        status: 'active',
+      },
+      select: {
+        id: true,
+        github_repo: true,
+        github_sync_enabled: true,
+        github_default_branch: true,
+        workspace_id: true,
+      },
+    })
 
     for (const project of projects) {
       try {

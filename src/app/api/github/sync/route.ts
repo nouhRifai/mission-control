@@ -1,22 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getDatabase } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { logger } from '@/lib/logger'
 import { pullFromGitHub } from '@/lib/github-sync-engine'
 import { getSyncPollerStatus } from '@/lib/github-sync-poller'
+import { getPrismaClient } from '@/lib/prisma'
 
 /**
  * GET /api/github/sync — sync status for all GitHub-linked projects.
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const workspaceId = auth.user.workspace_id ?? 1
 
-    const syncs = db.prepare(`
+    const syncs = await prisma.$queryRaw<any[]>`
       SELECT
         gs.project_id,
         p.name as project_name,
@@ -27,10 +27,10 @@ export async function GET(request: NextRequest) {
         COUNT(*) as sync_count
       FROM github_syncs gs
       LEFT JOIN projects p ON p.id = gs.project_id AND p.workspace_id = gs.workspace_id
-      WHERE gs.workspace_id = ? AND gs.project_id IS NOT NULL
+      WHERE gs.workspace_id = ${workspaceId} AND gs.project_id IS NOT NULL
       GROUP BY gs.project_id
       ORDER BY last_synced_at DESC
-    `).all(workspaceId)
+    `
 
     const poller = getSyncPollerStatus()
 
@@ -46,21 +46,20 @@ export async function GET(request: NextRequest) {
  * Body: { action: 'trigger', project_id: number } or { action: 'trigger-all' }
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
     const body = await request.json()
     const { action, project_id } = body
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const workspaceId = auth.user.workspace_id ?? 1
 
     if (action === 'trigger' && typeof project_id === 'number') {
-      const project = db.prepare(`
-        SELECT id, github_repo, github_sync_enabled, github_default_branch
-        FROM projects
-        WHERE id = ? AND workspace_id = ? AND status = 'active'
-      `).get(project_id, workspaceId) as any | undefined
+      const project = await prisma.projects.findFirst({
+        where: { id: project_id, workspace_id: workspaceId, status: 'active' },
+        select: { id: true, github_repo: true, github_sync_enabled: true, github_default_branch: true },
+      }) as any | null
 
       if (!project) {
         return NextResponse.json({ error: 'Project not found' }, { status: 404 })
@@ -74,11 +73,10 @@ export async function POST(request: NextRequest) {
     }
 
     if (action === 'trigger-all') {
-      const projects = db.prepare(`
-        SELECT id, github_repo, github_sync_enabled, github_default_branch
-        FROM projects
-        WHERE github_sync_enabled = 1 AND github_repo IS NOT NULL AND workspace_id = ? AND status = 'active'
-      `).all(workspaceId) as any[]
+      const projects = await prisma.projects.findMany({
+        where: { github_sync_enabled: 1, github_repo: { not: null }, workspace_id: workspaceId, status: 'active' },
+        select: { id: true, github_repo: true, github_sync_enabled: true, github_default_branch: true },
+      }) as any[]
 
       let totalPulled = 0
       let totalPushed = 0

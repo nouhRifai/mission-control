@@ -1,7 +1,8 @@
-import { getDatabase, db_helpers } from './db'
+import { db_helpers } from './db'
 import { runOpenClaw } from './command'
 import { eventBus } from './event-bus'
 import { logger } from './logger'
+import { getPrismaClient } from './prisma'
 
 interface DispatchableTask {
   id: number
@@ -229,9 +230,9 @@ function parseReviewVerdict(text: string): { status: 'approved' | 'rejected'; no
  * Uses an agent to evaluate the task resolution, then approves or rejects.
  */
 export async function runAegisReviews(): Promise<{ ok: boolean; message: string }> {
-  const db = getDatabase()
+  const prisma = getPrismaClient()
 
-  const tasks = db.prepare(`
+  const tasks = await prisma.$queryRaw<ReviewableTask[]>`
     SELECT t.id, t.title, t.description, t.resolution, t.assigned_to, t.workspace_id,
            p.ticket_prefix, t.project_ticket_no, a.config as agent_config
     FROM tasks t
@@ -240,7 +241,7 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
     WHERE t.status = 'review'
     ORDER BY t.updated_at ASC
     LIMIT 3
-  `).all() as ReviewableTask[]
+  `
 
   if (tasks.length === 0) {
     return { ok: true, message: 'No tasks awaiting review' }
@@ -249,9 +250,13 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
   const results: Array<{ id: number; verdict: string; error?: string }> = []
 
   for (const task of tasks) {
+    const now = Math.floor(Date.now() / 1000)
     // Move to quality_review to prevent re-processing
-    db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?')
-      .run('quality_review', Math.floor(Date.now() / 1000), task.id)
+    await prisma.tasks.update({
+      where: { id: task.id },
+      data: { status: 'quality_review', updated_at: now },
+      select: { id: true },
+    })
 
     eventBus.broadcast('task.status_changed', {
       id: task.id,
@@ -290,14 +295,24 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
       const verdict = parseReviewVerdict(agentResponse.text)
 
       // Insert quality review record
-      db.prepare(`
-        INSERT INTO quality_reviews (task_id, reviewer, status, notes, workspace_id)
-        VALUES (?, 'aegis', ?, ?, ?)
-      `).run(task.id, verdict.status, verdict.notes, task.workspace_id)
+      await prisma.quality_reviews.create({
+        data: {
+          task_id: task.id,
+          reviewer: 'aegis',
+          status: verdict.status,
+          notes: verdict.notes,
+          workspace_id: task.workspace_id,
+          created_at: now,
+        },
+        select: { id: true },
+      })
 
       if (verdict.status === 'approved') {
-        db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?')
-          .run('done', Math.floor(Date.now() / 1000), task.id)
+        await prisma.tasks.update({
+          where: { id: task.id },
+          data: { status: 'done', updated_at: now },
+          select: { id: true },
+        })
 
         eventBus.broadcast('task.status_changed', {
           id: task.id,
@@ -306,8 +321,15 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
         })
       } else {
         // Rejected: push back to in_progress with feedback
-        db.prepare('UPDATE tasks SET status = ?, error_message = ?, updated_at = ? WHERE id = ?')
-          .run('in_progress', `Aegis rejected: ${verdict.notes}`, Math.floor(Date.now() / 1000), task.id)
+        await prisma.tasks.update({
+          where: { id: task.id },
+          data: {
+            status: 'in_progress',
+            error_message: `Aegis rejected: ${verdict.notes}`,
+            updated_at: now,
+          },
+          select: { id: true },
+        })
 
         eventBus.broadcast('task.status_changed', {
           id: task.id,
@@ -316,10 +338,16 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
         })
 
         // Add rejection as a comment so the agent sees it on next dispatch
-        db.prepare(`
-          INSERT INTO comments (task_id, author, content, created_at, workspace_id)
-          VALUES (?, 'aegis', ?, ?, ?)
-        `).run(task.id, `Quality Review Rejected:\n${verdict.notes}`, Math.floor(Date.now() / 1000), task.workspace_id)
+        await prisma.comments.create({
+          data: {
+            task_id: task.id,
+            author: 'aegis',
+            content: `Quality Review Rejected:\n${verdict.notes}`,
+            created_at: now,
+            workspace_id: task.workspace_id,
+          },
+          select: { id: true },
+        })
       }
 
       db_helpers.logActivity(
@@ -339,8 +367,11 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
       logger.error({ taskId: task.id, err }, 'Aegis review failed')
 
       // Revert to review so it can be retried
-      db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?')
-        .run('review', Math.floor(Date.now() / 1000), task.id)
+      await prisma.tasks.update({
+        where: { id: task.id },
+        data: { status: 'review', updated_at: now },
+        select: { id: true },
+      })
 
       eventBus.broadcast('task.status_changed', {
         id: task.id,
@@ -363,9 +394,9 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
 }
 
 export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: string }> {
-  const db = getDatabase()
+  const prisma = getPrismaClient()
 
-  const tasks = db.prepare(`
+  const tasks = await prisma.$queryRaw<(DispatchableTask & { tags?: string; metadata?: string | null })[]>`
     SELECT t.*, a.name as agent_name, a.id as agent_id, a.config as agent_config,
            p.ticket_prefix, t.project_ticket_no
     FROM tasks t
@@ -377,7 +408,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
       CASE t.priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END ASC,
       t.created_at ASC
     LIMIT 3
-  `).all() as (DispatchableTask & { tags?: string })[]
+  `
 
   if (tasks.length === 0) {
     return { ok: true, message: 'No assigned tasks to dispatch' }
@@ -395,8 +426,11 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
 
   for (const task of tasks) {
     // Mark as in_progress immediately to prevent re-dispatch
-    db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?')
-      .run('in_progress', now, task.id)
+    await prisma.tasks.update({
+      where: { id: task.id },
+      data: { status: 'in_progress', updated_at: now },
+      select: { id: true },
+    })
 
     eventBus.broadcast('task.status_changed', {
       id: task.id,
@@ -416,11 +450,15 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
 
     try {
       // Check for previous Aegis rejection feedback
-      const rejectionRow = db.prepare(`
-        SELECT content FROM comments
-        WHERE task_id = ? AND author = 'aegis' AND content LIKE 'Quality Review Rejected:%'
-        ORDER BY created_at DESC LIMIT 1
-      `).get(task.id) as { content: string } | undefined
+      const rejectionRow = await prisma.comments.findFirst({
+        where: {
+          task_id: task.id,
+          author: 'aegis',
+          content: { startsWith: 'Quality Review Rejected:' },
+        },
+        orderBy: { created_at: 'desc' },
+        select: { content: true },
+      })
       const rejectionFeedback = rejectionRow?.content?.replace(/^Quality Review Rejected:\n?/, '') || null
 
       const prompt = buildTaskPrompt(task, rejectionFeedback)
@@ -466,8 +504,8 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
       // Merge dispatch_session_id into existing metadata
       const existingMeta = (() => {
         try {
-          const row = db.prepare('SELECT metadata FROM tasks WHERE id = ?').get(task.id) as { metadata: string } | undefined
-          return row?.metadata ? JSON.parse(row.metadata) : {}
+          const raw = (task as any)?.metadata
+          return raw ? JSON.parse(raw) : {}
         } catch { return {} }
       })()
       if (agentResponse.sessionId) {
@@ -475,21 +513,29 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
       }
 
       // Update task: status → review, set outcome
-      db.prepare(`
-        UPDATE tasks SET status = ?, outcome = ?, resolution = ?, metadata = ?, updated_at = ? WHERE id = ?
-      `).run('review', 'success', truncated, JSON.stringify(existingMeta), Math.floor(Date.now() / 1000), task.id)
+      await prisma.tasks.update({
+        where: { id: task.id },
+        data: {
+          status: 'review',
+          outcome: 'success',
+          resolution: truncated,
+          metadata: JSON.stringify(existingMeta),
+          updated_at: Math.floor(Date.now() / 1000),
+        },
+        select: { id: true },
+      })
 
       // Add a comment from the agent with the full response
-      db.prepare(`
-        INSERT INTO comments (task_id, author, content, created_at, workspace_id)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(
-        task.id,
-        task.agent_name,
-        truncated,
-        Math.floor(Date.now() / 1000),
-        task.workspace_id
-      )
+      await prisma.comments.create({
+        data: {
+          task_id: task.id,
+          author: task.agent_name,
+          content: truncated,
+          created_at: Math.floor(Date.now() / 1000),
+          workspace_id: task.workspace_id,
+        },
+        select: { id: true },
+      })
 
       eventBus.broadcast('task.status_changed', {
         id: task.id,
@@ -522,8 +568,15 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
       logger.error({ taskId: task.id, agent: task.agent_name, err }, 'Task dispatch failed')
 
       // Revert to assigned so it can be retried on the next tick
-      db.prepare('UPDATE tasks SET status = ?, error_message = ?, updated_at = ? WHERE id = ?')
-        .run('assigned', errorMsg.substring(0, 5000), Math.floor(Date.now() / 1000), task.id)
+      await prisma.tasks.update({
+        where: { id: task.id },
+        data: {
+          status: 'assigned',
+          error_message: errorMsg.substring(0, 5000),
+          updated_at: Math.floor(Date.now() / 1000),
+        },
+        select: { id: true },
+      })
 
       eventBus.broadcast('task.status_changed', {
         id: task.id,

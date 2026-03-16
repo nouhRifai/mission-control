@@ -5,7 +5,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { requireRole } from '@/lib/auth'
 import { config } from '@/lib/config'
-import { getDatabase } from '@/lib/db'
+import { logAuditEvent } from '@/lib/db'
 import { logger } from '@/lib/logger'
 import { FIX_SAFETY, runSecurityScan, type FixSafety } from '@/lib/security-scan'
 
@@ -56,7 +56,7 @@ function getFailingChecks() {
 }
 
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   // Optional: pass { ids: ["check_id"] } to fix only specific issues
@@ -272,10 +272,10 @@ export async function POST(request: NextRequest) {
       if (shouldFix('exec_restricted')) {
         if (!ocConfig.tools) ocConfig.tools = {}
         if (!ocConfig.tools.exec) ocConfig.tools.exec = {}
-        if (ocConfig.tools.exec.security !== 'sandbox' && ocConfig.tools.exec.security !== 'deny') {
-          ocConfig.tools.exec.security = 'sandbox'
+        if (ocConfig.tools.exec.security !== 'allowlist' && ocConfig.tools.exec.security !== 'deny') {
+          ocConfig.tools.exec.security = 'allowlist'
           configChanged = true
-          results.push({ id: 'exec_restricted', name: 'Exec tool restriction', fixed: true, detail: 'Set exec security to "sandbox"', fixSafety: FIX_SAFETY['exec_restricted'] })
+          results.push({ id: 'exec_restricted', name: 'Exec tool restriction', fixed: true, detail: 'Set exec security to "allowlist"', fixSafety: FIX_SAFETY['exec_restricted'] })
         }
       }
 
@@ -348,10 +348,11 @@ export async function POST(request: NextRequest) {
 
   // Audit log
   try {
-    const db = getDatabase()
-    db.prepare(
-      'INSERT INTO audit_log (action, actor, detail) VALUES (?, ?, ?)'
-    ).run('security.auto_fix', auth.user.username, JSON.stringify({ fixes: results.filter(r => r.fixed).map(r => r.id) }))
+    logAuditEvent({
+      action: 'security.auto_fix',
+      actor: auth.user.username,
+      detail: { fixes: results.filter(r => r.fixed).map(r => r.id) },
+    })
   } catch { /* non-critical */ }
 
   const fixed = results.filter(r => r.fixed).length

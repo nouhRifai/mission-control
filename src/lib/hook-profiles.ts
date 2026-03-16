@@ -9,7 +9,7 @@
  * Profile is stored in the settings table under key 'hook_profile'.
  */
 
-import { getDatabase } from '@/lib/db'
+import { getPrismaClient } from '@/lib/prisma'
 
 export type HookProfileLevel = 'minimal' | 'standard' | 'strict'
 
@@ -45,11 +45,12 @@ const PROFILES: Record<HookProfileLevel, HookProfile> = {
   },
 }
 
-export function getActiveProfile(): HookProfile {
-  const db = getDatabase()
-  const row = db.prepare(
-    `SELECT value FROM settings WHERE key = 'hook_profile'`
-  ).get() as { value: string } | undefined
+export async function getActiveProfile(): Promise<HookProfile> {
+  const prisma = getPrismaClient()
+  const row = await prisma.settings.findUnique({
+    where: { key: 'hook_profile' },
+    select: { value: true },
+  }).catch(() => null)
 
   const level = row?.value as HookProfileLevel
   if (level && PROFILES[level]) {
@@ -58,18 +59,18 @@ export function getActiveProfile(): HookProfile {
   return PROFILES.standard
 }
 
-export function shouldScanSecrets(): boolean {
-  return getActiveProfile().scanSecrets
+export async function shouldScanSecrets(): Promise<boolean> {
+  return (await getActiveProfile()).scanSecrets
 }
 
-export function shouldAuditMcpCalls(): boolean {
-  return getActiveProfile().auditMcpCalls
+export async function shouldAuditMcpCalls(): Promise<boolean> {
+  return (await getActiveProfile()).auditMcpCalls
 }
 
-export function shouldBlockOnSecretDetection(): boolean {
-  return getActiveProfile().blockOnSecretDetection
+export async function shouldBlockOnSecretDetection(): Promise<boolean> {
+  return (await getActiveProfile()).blockOnSecretDetection
 }
 
-export function getRateLimitMultiplier(): number {
-  return getActiveProfile().rateLimitMultiplier
+export async function getRateLimitMultiplier(): Promise<number> {
+  return (await getActiveProfile()).rateLimitMultiplier
 }

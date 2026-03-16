@@ -1,21 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDatabase, Notification, db_helpers } from '@/lib/db';
+import { Notification, db_helpers } from '@/lib/db';
 import { runOpenClaw } from '@/lib/command';
 import { requireRole } from '@/lib/auth';
 import { logger } from '@/lib/logger';
+import { getPrismaClient } from '@/lib/prisma';
 
 /**
  * POST /api/notifications/deliver - Notification delivery daemon endpoint
  * 
- * Polls undelivered notifications and sends them to agent sessions
- * via OpenClaw sessions_send command
+ * Polls undelivered notifications and sends them to agents
+ * via OpenClaw gateway call agent command
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator');
+  const auth = await requireRole(request, 'operator');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const body = await request.json();
     const workspaceId = auth.user.workspace_id ?? 1;
     const {
@@ -25,24 +26,29 @@ export async function POST(request: NextRequest) {
     } = body;
     
     // Get undelivered notifications
-    let query = `
-      SELECT n.*, a.session_key 
-      FROM notifications n
-      LEFT JOIN agents a ON n.recipient = a.name AND a.workspace_id = n.workspace_id
-      WHERE n.delivered_at IS NULL AND n.workspace_id = ?
-    `;
-    
-    const params: any[] = [workspaceId];
-    
-    if (agent_filter) {
-      query += ' AND n.recipient = ?';
-      params.push(agent_filter);
+    const undeliveredNotifications = await prisma.notifications.findMany({
+      where: {
+        delivered_at: null,
+        workspace_id: workspaceId,
+        ...(agent_filter ? { recipient: agent_filter } : {}),
+      },
+      orderBy: { created_at: 'asc' },
+      take: Math.min(Number(limit) || 50, 500),
+    }) as unknown as (Notification & { session_key?: string })[]
+
+    const recipients = Array.from(
+      new Set(undeliveredNotifications.map((n) => n.recipient).filter(Boolean))
+    ) as string[]
+    const agents = recipients.length
+      ? await prisma.agents.findMany({
+          where: { workspace_id: workspaceId, name: { in: recipients } },
+          select: { name: true, session_key: true },
+        })
+      : []
+    const sessionKeyByAgent = new Map(agents.map((a) => [a.name, a.session_key]))
+    for (const n of undeliveredNotifications) {
+      ;(n as any).session_key = sessionKeyByAgent.get(n.recipient) || null
     }
-    
-    query += ' ORDER BY n.created_at ASC LIMIT ?';
-    params.push(limit);
-    
-    const undeliveredNotifications = db.prepare(query).all(...params) as (Notification & { session_key?: string })[];
     
     if (undeliveredNotifications.length === 0) {
       return NextResponse.json({
@@ -59,17 +65,14 @@ export async function POST(request: NextRequest) {
     const errors: any[] = [];
     const deliveryResults: any[] = [];
 
-    // Prepare update statement once (avoids N+1)
-    const markDeliveredStmt = db.prepare('UPDATE notifications SET delivered_at = ? WHERE id = ? AND workspace_id = ?');
-
     for (const notification of undeliveredNotifications) {
       try {
-        // Skip if agent doesn't have session key
-        if (!notification.session_key) {
+        // Skip if agent is not registered in the agents table
+        if (!notification.recipient) {
           errors.push({
             notification_id: notification.id,
             recipient: notification.recipient,
-            error: 'Agent has no session key configured'
+            error: 'Notification has no recipient'
           });
           errorCount++;
           continue;
@@ -79,27 +82,36 @@ export async function POST(request: NextRequest) {
         const message = formatNotificationMessage(notification);
         
         if (!dry_run) {
-          // Send notification via OpenClaw sessions_send
+          // Send notification via OpenClaw gateway call agent
           try {
+            const invokeParams = {
+              message,
+              agentId: notification.recipient,
+              idempotencyKey: `notification-${notification.id}-${Date.now()}`,
+              deliver: false,
+            };
             const { stdout, stderr } = await runOpenClaw(
               [
                 'gateway',
-                'sessions_send',
-                '--session',
-                notification.session_key,
-                '--message',
-                message
+                'call',
+                'agent',
+                '--params',
+                JSON.stringify(invokeParams),
+                '--json'
               ],
-              { timeoutMs: 10000 }
+              { timeoutMs: 30000 }
             );
-            
+
             if (stderr && stderr.includes('error')) {
               throw new Error(`OpenClaw error: ${stderr}`);
             }
             
             // Mark as delivered
             const now = Math.floor(Date.now() / 1000);
-            markDeliveredStmt.run(now, notification.id, workspaceId);
+            await prisma.notifications.updateMany({
+              where: { id: (notification as any).id, workspace_id: workspaceId },
+              data: { delivered_at: now },
+            })
             
             deliveredCount++;
             deliveryResults.push({
@@ -188,69 +200,69 @@ export async function POST(request: NextRequest) {
  * GET /api/notifications/deliver - Get delivery status and statistics
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const { searchParams } = new URL(request.url);
     const workspaceId = auth.user.workspace_id ?? 1;
     const agent = searchParams.get('agent');
     
     // Get delivery statistics
-    let baseQuery = 'SELECT COUNT(*) as count FROM notifications WHERE workspace_id = ?';
-    let params: any[] = [workspaceId];
-    
-    if (agent) {
-      baseQuery += ' AND recipient = ?';
-      params.push(agent);
-    }
-    
-    const totalNotifications = db.prepare(baseQuery).get(...params) as { count: number };
-    
-    const undeliveredCount = db.prepare(
-      baseQuery + ' AND delivered_at IS NULL'
-    ).get(...params) as { count: number };
-    
-    const deliveredCount = db.prepare(
-      baseQuery + ' AND delivered_at IS NOT NULL'
-    ).get(...params) as { count: number };
+    const baseWhere: any = { workspace_id: workspaceId }
+    if (agent) baseWhere.recipient = agent
+
+    const [totalCount, undeliveredCount, deliveredCount] = await Promise.all([
+      prisma.notifications.count({ where: baseWhere }),
+      prisma.notifications.count({ where: { ...baseWhere, delivered_at: null } }),
+      prisma.notifications.count({ where: { ...baseWhere, delivered_at: { not: null } } }),
+    ])
     
     // Get recent delivery activity
-    const recentDeliveries = db.prepare(`
-      SELECT 
-        recipient,
-        type,
-        title,
-        delivered_at,
-        created_at
-      FROM notifications 
-      WHERE delivered_at IS NOT NULL AND workspace_id = ?
-      ${agent ? 'AND recipient = ?' : ''}
-      ORDER BY delivered_at DESC 
-      LIMIT 10
-    `).all(...(agent ? [workspaceId, agent] : [workspaceId]));
+    const recentDeliveries = await prisma.notifications.findMany({
+      where: { ...baseWhere, delivered_at: { not: null } },
+      select: { recipient: true, type: true, title: true, delivered_at: true, created_at: true },
+      orderBy: { delivered_at: 'desc' },
+      take: 10,
+    })
     
     // Get agents with pending notifications
-    const agentsPending = db.prepare(`
-      SELECT 
-        n.recipient,
-        a.session_key,
-        COUNT(*) as pending_count
-      FROM notifications n
-      LEFT JOIN agents a ON n.recipient = a.name AND a.workspace_id = n.workspace_id
-      WHERE n.delivered_at IS NULL AND n.workspace_id = ?
-      GROUP BY n.recipient, a.session_key
-      ORDER BY pending_count DESC
-    `).all(workspaceId) as any[];
+    // Prisma `groupBy` typings can be fragile when the client is generated in dual-provider mode,
+    // so we count recipients in-memory. This endpoint is diagnostics-style and bounded by workspace.
+    const pendingRows = await prisma.notifications.findMany({
+      where: { ...baseWhere, delivered_at: null },
+      select: { recipient: true },
+    })
+    const pendingByRecipient = new Map<string, number>()
+    for (const row of pendingRows) {
+      if (!row.recipient) continue
+      pendingByRecipient.set(row.recipient, (pendingByRecipient.get(row.recipient) ?? 0) + 1)
+    }
+    const pendingGroups = Array.from(pendingByRecipient.entries())
+      .map(([recipient, pending_count]) => ({ recipient, pending_count }))
+      .sort((a, b) => b.pending_count - a.pending_count)
+    const pendingRecipients = pendingGroups.map((g) => g.recipient)
+    const pendingAgents = pendingRecipients.length
+      ? await prisma.agents.findMany({
+          where: { workspace_id: workspaceId, name: { in: pendingRecipients } },
+          select: { name: true, session_key: true },
+        })
+      : []
+    const pendingSessionKey = new Map(pendingAgents.map((a) => [a.name, a.session_key]))
+    const agentsPending = pendingGroups.map((g) => ({
+      recipient: g.recipient,
+      session_key: pendingSessionKey.get(g.recipient) ?? null,
+      pending_count: g.pending_count,
+    }))
     
     return NextResponse.json({
       statistics: {
-        total: totalNotifications.count,
-        delivered: deliveredCount.count,
-        undelivered: undeliveredCount.count,
-        delivery_rate: totalNotifications.count > 0 ? 
-          Math.round((deliveredCount.count / totalNotifications.count) * 100) : 0
+        total: totalCount,
+        delivered: deliveredCount,
+        undelivered: undeliveredCount,
+        delivery_rate: totalCount > 0 ? 
+          Math.round((deliveredCount / totalCount) * 100) : 0
       },
       agents_with_pending: agentsPending,
       recent_deliveries: recentDeliveries,

@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getDatabase, db_helpers } from '@/lib/db'
+import { db_helpers } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { validateBody, createWorkflowSchema } from '@/lib/validation'
 import { mutationLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
 import { scanForInjection } from '@/lib/injection-guard'
+import { getPrismaClient } from '@/lib/prisma'
 
 export interface WorkflowTemplate {
   id: number
@@ -26,15 +27,16 @@ export interface WorkflowTemplate {
  * GET /api/workflows - List all workflow templates
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const workspaceId = auth.user.workspace_id ?? 1
-    const templates = db
-      .prepare('SELECT * FROM workflow_templates WHERE workspace_id = ? ORDER BY use_count DESC, updated_at DESC')
-      .all(workspaceId) as WorkflowTemplate[]
+    const templates = (await prisma.workflow_templates.findMany({
+      where: { workspace_id: workspaceId },
+      orderBy: [{ use_count: 'desc' }, { updated_at: 'desc' }],
+    })) as unknown as WorkflowTemplate[]
 
     const parsed = templates.map(t => ({
       ...t,
@@ -52,7 +54,7 @@ export async function GET(request: NextRequest) {
  * POST /api/workflows - Create a new workflow template
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = mutationLimiter(request)
@@ -76,33 +78,31 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const user = auth.user
     const workspaceId = auth.user.workspace_id ?? 1
 
-    const insertResult = db.prepare(`
-      INSERT INTO workflow_templates (name, description, model, task_prompt, timeout_seconds, agent_role, tags, created_by, workspace_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      name,
-      description || null,
-      model,
-      task_prompt,
-      timeout_seconds,
-      agent_role || null,
-      JSON.stringify(tags),
-      user?.username || 'system',
-      workspaceId
-    )
-
-    const template = db
-      .prepare('SELECT * FROM workflow_templates WHERE id = ? AND workspace_id = ?')
-      .get(insertResult.lastInsertRowid, workspaceId) as WorkflowTemplate
+    const now = Math.floor(Date.now() / 1000)
+    const template = (await prisma.workflow_templates.create({
+      data: {
+        name,
+        description: description || null,
+        model,
+        task_prompt,
+        timeout_seconds,
+        agent_role: agent_role || null,
+        tags: JSON.stringify(tags),
+        created_by: user?.username || 'system',
+        workspace_id: workspaceId,
+        created_at: now,
+        updated_at: now,
+      } as any,
+    })) as unknown as WorkflowTemplate
 
     db_helpers.logActivity(
       'workflow_created',
       'workflow',
-      Number(insertResult.lastInsertRowid),
+      template.id,
       user?.username || 'system',
       `Created workflow template: ${name}`,
       undefined,
@@ -122,14 +122,14 @@ export async function POST(request: NextRequest) {
  * PUT /api/workflows - Update a workflow template
  */
 export async function PUT(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = mutationLimiter(request)
   if (rateCheck) return rateCheck
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const workspaceId = auth.user.workspace_id ?? 1
     const body = await request.json()
     const { id, ...updates } = body
@@ -138,40 +138,40 @@ export async function PUT(request: NextRequest) {
       return NextResponse.json({ error: 'Template ID is required' }, { status: 400 })
     }
 
-    const existing = db
-      .prepare('SELECT * FROM workflow_templates WHERE id = ? AND workspace_id = ?')
-      .get(id, workspaceId) as WorkflowTemplate
+    const existing = await prisma.workflow_templates.findFirst({
+      where: { id: Number(id), workspace_id: workspaceId },
+      select: { id: true },
+    })
     if (!existing) {
       return NextResponse.json({ error: 'Template not found' }, { status: 404 })
     }
 
-    const fields: string[] = []
-    const params: any[] = []
+    const data: any = {}
 
-    if (updates.name !== undefined) { fields.push('name = ?'); params.push(updates.name) }
-    if (updates.description !== undefined) { fields.push('description = ?'); params.push(updates.description) }
-    if (updates.model !== undefined) { fields.push('model = ?'); params.push(updates.model) }
-    if (updates.task_prompt !== undefined) { fields.push('task_prompt = ?'); params.push(updates.task_prompt) }
-    if (updates.timeout_seconds !== undefined) { fields.push('timeout_seconds = ?'); params.push(updates.timeout_seconds) }
-    if (updates.agent_role !== undefined) { fields.push('agent_role = ?'); params.push(updates.agent_role) }
-    if (updates.tags !== undefined) { fields.push('tags = ?'); params.push(JSON.stringify(updates.tags)) }
+    if (updates.name !== undefined) data.name = updates.name
+    if (updates.description !== undefined) data.description = updates.description
+    if (updates.model !== undefined) data.model = updates.model
+    if (updates.task_prompt !== undefined) data.task_prompt = updates.task_prompt
+    if (updates.timeout_seconds !== undefined) data.timeout_seconds = updates.timeout_seconds
+    if (updates.agent_role !== undefined) data.agent_role = updates.agent_role
+    if (updates.tags !== undefined) data.tags = JSON.stringify(updates.tags)
 
     // No explicit field updates = usage tracking call (from orchestration bar)
-    if (fields.length === 0) {
-      fields.push('use_count = use_count + 1')
-      fields.push('last_used_at = ?')
-      params.push(Math.floor(Date.now() / 1000))
+    if (Object.keys(data).length === 0) {
+      data.use_count = { increment: 1 }
+      data.last_used_at = Math.floor(Date.now() / 1000)
     }
 
-    fields.push('updated_at = ?')
-    params.push(Math.floor(Date.now() / 1000))
-    params.push(id, workspaceId)
+    data.updated_at = Math.floor(Date.now() / 1000)
+    await prisma.workflow_templates.updateMany({
+      where: { id: Number(id), workspace_id: workspaceId },
+      data,
+    })
 
-    db.prepare(`UPDATE workflow_templates SET ${fields.join(', ')} WHERE id = ? AND workspace_id = ?`).run(...params)
-
-    const updated = db
-      .prepare('SELECT * FROM workflow_templates WHERE id = ? AND workspace_id = ?')
-      .get(id, workspaceId) as WorkflowTemplate
+    const updated = (await prisma.workflow_templates.findFirst({
+      where: { id: Number(id), workspace_id: workspaceId },
+    })) as unknown as WorkflowTemplate | null
+    if (!updated) return NextResponse.json({ error: 'Template not found' }, { status: 404 })
     return NextResponse.json({ template: { ...updated, tags: updated.tags ? JSON.parse(updated.tags) : [] } })
   } catch (error) {
     logger.error({ err: error }, 'PUT /api/workflows error')
@@ -183,14 +183,14 @@ export async function PUT(request: NextRequest) {
  * DELETE /api/workflows - Delete a workflow template
  */
 export async function DELETE(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = mutationLimiter(request)
   if (rateCheck) return rateCheck
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const workspaceId = auth.user.workspace_id ?? 1
     let body: any
     try { body = await request.json() } catch { return NextResponse.json({ error: 'Request body required' }, { status: 400 }) }
@@ -200,8 +200,8 @@ export async function DELETE(request: NextRequest) {
       return NextResponse.json({ error: 'Template ID is required' }, { status: 400 })
     }
 
-    const result = db.prepare('DELETE FROM workflow_templates WHERE id = ? AND workspace_id = ?').run(parseInt(id), workspaceId)
-    if (result.changes === 0) {
+    const result = await prisma.workflow_templates.deleteMany({ where: { id: parseInt(id), workspace_id: workspaceId } })
+    if (result.count === 0) {
       return NextResponse.json({ error: 'Template not found' }, { status: 404 })
     }
     return NextResponse.json({ success: true })

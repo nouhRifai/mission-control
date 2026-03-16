@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
-import { getDatabase, logAuditEvent } from '@/lib/db'
+import { logAuditEvent } from '@/lib/db'
 import { config } from '@/lib/config'
 import { mutationLimiter } from '@/lib/rate-limit'
 import { validateBody, updateSettingsSchema } from '@/lib/validation'
+import { getPrismaClient } from '@/lib/prisma'
 
 interface SettingRow {
   key: string
@@ -61,11 +62,13 @@ const settingDefinitions: Record<string, { category: string; description: string
  * GET /api/settings - List all settings (grouped by category)
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
-  const db = getDatabase()
-  const rows = db.prepare('SELECT * FROM settings ORDER BY category, key').all() as SettingRow[]
+  const prisma = getPrismaClient()
+  const rows = await prisma.settings.findMany({
+    orderBy: [{ category: 'asc' }, { key: 'asc' }],
+  }) as unknown as SettingRow[]
   const stored = new Map(rows.map(r => [r.key, r]))
 
   // Merge defaults with stored values
@@ -122,7 +125,7 @@ export async function GET(request: NextRequest) {
  * Body: { settings: { key: value, ... } }
  */
 export async function PUT(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = mutationLimiter(request)
@@ -132,36 +135,48 @@ export async function PUT(request: NextRequest) {
   if ('error' in result) return result.error
   const body = result.data
 
-  const db = getDatabase()
-  const upsert = db.prepare(`
-    INSERT INTO settings (key, value, description, category, updated_by, updated_at)
-    VALUES (?, ?, ?, ?, ?, unixepoch())
-    ON CONFLICT(key) DO UPDATE SET
-      value = excluded.value,
-      updated_by = excluded.updated_by,
-      updated_at = unixepoch()
-  `)
-
+  const prisma = getPrismaClient()
   const updated: string[] = []
   const changes: Record<string, { old: string | null; new: string }> = {}
 
-  const txn = db.transaction(() => {
+  const now = Math.floor(Date.now() / 1000)
+  const keys = Object.keys(body.settings)
+  const existingRows = keys.length === 0
+    ? []
+    : await prisma.settings.findMany({
+        where: { key: { in: keys } },
+        select: { key: true, value: true },
+      })
+  const existingMap = new Map(existingRows.map((r) => [r.key, r.value]))
+
+  await prisma.$transaction(async (tx) => {
     for (const [key, value] of Object.entries(body.settings)) {
       const strValue = String(value)
       const def = settingDefinitions[key]
       const category = def?.category ?? 'custom'
       const description = def?.description ?? null
 
-      // Get old value for audit
-      const existing = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | undefined
-      changes[key] = { old: existing?.value ?? null, new: strValue }
+      changes[key] = { old: existingMap.get(key) ?? null, new: strValue }
 
-      upsert.run(key, strValue, description, category, auth.user.username)
+      await tx.settings.upsert({
+        where: { key },
+        create: {
+          key,
+          value: strValue,
+          description,
+          category,
+          updated_by: auth.user.username,
+          updated_at: now,
+        },
+        update: {
+          value: strValue,
+          updated_by: auth.user.username,
+          updated_at: now,
+        },
+      })
       updated.push(key)
     }
   })
-
-  txn()
 
   // Audit log
   const ipAddress = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown'
@@ -180,7 +195,7 @@ export async function PUT(request: NextRequest) {
  * DELETE /api/settings?key=... - Reset a setting to default
  */
 export async function DELETE(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = mutationLimiter(request)
@@ -194,14 +209,14 @@ export async function DELETE(request: NextRequest) {
     return NextResponse.json({ error: 'key parameter required' }, { status: 400 })
   }
 
-  const db = getDatabase()
-  const existing = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | undefined
+  const prisma = getPrismaClient()
+  const existing = await prisma.settings.findUnique({ where: { key }, select: { value: true } })
 
   if (!existing) {
     return NextResponse.json({ error: 'Setting not found or already at default' }, { status: 404 })
   }
 
-  db.prepare('DELETE FROM settings WHERE key = ?').run(key)
+  await prisma.settings.delete({ where: { key }, select: { key: true } })
 
   const ipAddress = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown'
   logAuditEvent({

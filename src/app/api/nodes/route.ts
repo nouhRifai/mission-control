@@ -24,7 +24,7 @@ async function isGatewayReachable(): Promise<boolean> {
 }
 
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const action = request.nextUrl.searchParams.get('action') || 'list'
@@ -94,7 +94,7 @@ const ACTION_RPC_MAP: Record<DeviceAction, { method: string; paramKey: 'requestI
  * Body: { action: DeviceAction, requestId?: string, deviceId?: string, role?: string, scopes?: string[] }
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   let body: Record<string, unknown>

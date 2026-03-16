@@ -1,11 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getDatabase } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { readLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
 import { getSecurityPosture } from '@/lib/security-events'
-import { getMcpCallStats } from '@/lib/mcp-audit'
 import { runSecurityScan } from '@/lib/security-scan'
+import { getPrismaClient } from '@/lib/prisma'
 
 type Timeframe = 'hour' | 'day' | 'week' | 'month'
 
@@ -17,7 +16,7 @@ const TIMEFRAME_SECONDS: Record<Timeframe, number> = {
 }
 
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = readLimiter(request)
@@ -33,13 +32,13 @@ export async function GET(request: NextRequest) {
 
     const seconds = TIMEFRAME_SECONDS[timeframe] || TIMEFRAME_SECONDS.day
     const since = Math.floor(Date.now() / 1000) - seconds
-    const db = getDatabase()
+    const prisma = getPrismaClient()
 
     // Infrastructure scan (same as onboarding security scan)
     const scan = runSecurityScan()
 
     // Event-based posture (incidents, trust scores)
-    const eventPosture = getSecurityPosture(workspaceId)
+    const eventPosture = await getSecurityPosture(workspaceId)
 
     // Blend: weighted average — 70% infrastructure config, 30% event history
     const blendedScore = Math.round(scan.score * 0.7 + eventPosture.score * 0.3)
@@ -49,116 +48,122 @@ export async function GET(request: NextRequest) {
       : 'at-risk'
 
     // Auth events
-    const authEventsQuery = db.prepare(`
-      SELECT event_type, severity, agent_name, detail, ip_address, created_at
-      FROM security_events
-      WHERE workspace_id = ? AND created_at > ?
-        AND event_type IN ('auth.failure', 'auth.token_rotation', 'auth.access_denied')
-      ORDER BY created_at DESC
-      LIMIT 50
-    `).all(workspaceId, since) as any[]
+    const authEventsQuery = await prisma.security_events.findMany({
+      where: {
+        workspace_id: workspaceId,
+        created_at: { gt: since },
+        event_type: { in: ['auth.failure', 'auth.token_rotation', 'auth.access_denied'] },
+      },
+      orderBy: { created_at: 'desc' },
+      take: 50,
+      select: { event_type: true, severity: true, agent_name: true, detail: true, ip_address: true, created_at: true },
+    }) as any[]
 
     const loginFailures = authEventsQuery.filter(e => e.event_type === 'auth.failure').length
     const tokenRotations = authEventsQuery.filter(e => e.event_type === 'auth.token_rotation').length
     const accessDenials = authEventsQuery.filter(e => e.event_type === 'auth.access_denied').length
 
     // Agent trust
-    const agents = db.prepare(`
-      SELECT agent_name, trust_score, last_anomaly_at,
-        auth_failures + injection_attempts + rate_limit_hits + secret_exposures as anomalies
-      FROM agent_trust_scores
-      WHERE workspace_id = ?
-      ORDER BY trust_score ASC
-    `).all(workspaceId) as any[]
+    const agents = await prisma.agent_trust_scores.findMany({
+      where: { workspace_id: workspaceId },
+      orderBy: { trust_score: 'asc' },
+      select: {
+        agent_name: true,
+        trust_score: true,
+        last_anomaly_at: true,
+        auth_failures: true,
+        injection_attempts: true,
+        rate_limit_hits: true,
+        secret_exposures: true,
+      },
+    }) as any[]
 
     const flaggedCount = agents.filter((a: any) => a.trust_score < 0.8).length
 
     // Secret exposures
-    const secretEvents = db.prepare(`
-      SELECT event_type, severity, agent_name, detail, created_at
-      FROM security_events
-      WHERE workspace_id = ? AND created_at > ? AND event_type = 'secret.exposure'
-      ORDER BY created_at DESC
-      LIMIT 20
-    `).all(workspaceId, since) as any[]
+    const secretEvents = await prisma.security_events.findMany({
+      where: { workspace_id: workspaceId, created_at: { gt: since }, event_type: 'secret.exposure' },
+      orderBy: { created_at: 'desc' },
+      take: 20,
+      select: { event_type: true, severity: true, agent_name: true, detail: true, created_at: true },
+    }) as any[]
 
     // MCP audit summary
-    const mcpTotals = db.prepare(`
+    const mcpTotals = (await prisma.$queryRaw<any[]>`
       SELECT
         COUNT(*) as total_calls,
         COUNT(DISTINCT tool_name) as unique_tools,
         SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) as failures
       FROM mcp_call_log
-      WHERE workspace_id = ? AND created_at > ?
-    `).get(workspaceId, since) as any
+      WHERE workspace_id = ${workspaceId} AND created_at > ${since}
+    `)[0] as any
 
-    const topTools = db.prepare(`
+    const topTools = await prisma.$queryRaw<any[]>`
       SELECT tool_name, COUNT(*) as count
       FROM mcp_call_log
-      WHERE workspace_id = ? AND created_at > ?
+      WHERE workspace_id = ${workspaceId} AND created_at > ${since}
       GROUP BY tool_name
       ORDER BY count DESC
       LIMIT 10
-    `).all(workspaceId, since) as any[]
+    `
 
-    const totalCalls = mcpTotals?.total_calls ?? 0
+    const toNumber = (v: any) => (typeof v === 'bigint' ? Number(v) : (Number.isFinite(Number(v)) ? Number(v) : 0))
+    const totalCalls = toNumber(mcpTotals?.total_calls)
     const failureRate = totalCalls > 0
-      ? Math.round(((mcpTotals?.failures ?? 0) / totalCalls) * 10000) / 100
+      ? Math.round((toNumber(mcpTotals?.failures) / totalCalls) * 10000) / 100
       : 0
 
     // Rate limit hits
-    const rateLimitEvents = db.prepare(`
-      SELECT COUNT(*) as total
-      FROM security_events
-      WHERE workspace_id = ? AND created_at > ? AND event_type = 'rate_limit.hit'
-    `).get(workspaceId, since) as any
-
-    const rateLimitByIp = db.prepare(`
+    const rateLimitTotal = await prisma.security_events.count({
+      where: { workspace_id: workspaceId, created_at: { gt: since }, event_type: 'rate_limit.hit' },
+    })
+    const rateLimitByIp = await prisma.$queryRaw<any[]>`
       SELECT ip_address, COUNT(*) as count
       FROM security_events
-      WHERE workspace_id = ? AND created_at > ? AND event_type = 'rate_limit.hit' AND ip_address IS NOT NULL
+      WHERE workspace_id = ${workspaceId}
+        AND created_at > ${since}
+        AND event_type = 'rate_limit.hit'
+        AND ip_address IS NOT NULL
       GROUP BY ip_address
       ORDER BY count DESC
       LIMIT 10
-    `).all(workspaceId, since) as any[]
+    `
 
     // Injection attempts
-    const injectionEvents = db.prepare(`
-      SELECT event_type, severity, agent_name, detail, ip_address, created_at
-      FROM security_events
-      WHERE workspace_id = ? AND created_at > ? AND event_type = 'injection.attempt'
-      ORDER BY created_at DESC
-      LIMIT 20
-    `).all(workspaceId, since) as any[]
+    const injectionEvents = await prisma.security_events.findMany({
+      where: { workspace_id: workspaceId, created_at: { gt: since }, event_type: 'injection.attempt' },
+      orderBy: { created_at: 'desc' },
+      take: 20,
+      select: { event_type: true, severity: true, agent_name: true, detail: true, ip_address: true, created_at: true },
+    }) as any[]
 
     // Timeline (bucketed by hour)
     const bucketSize = timeframe === 'hour' ? 300 : 3600
-    let timelineQuery = `
-      SELECT
-        (created_at / ${bucketSize}) * ${bucketSize} as bucket,
-        COUNT(*) as event_count,
-        MAX(CASE WHEN severity = 'critical' THEN 3 WHEN severity = 'warning' THEN 2 ELSE 1 END) as max_severity
-      FROM security_events
-      WHERE workspace_id = ? AND created_at > ?
-    `
-    const timelineParams: any[] = [workspaceId, since]
-
-    if (eventTypeFilter) {
-      timelineQuery += ' AND event_type = ?'
-      timelineParams.push(eventTypeFilter)
+    const timelineWhere: any = {
+      workspace_id: workspaceId,
+      created_at: { gt: since },
+      ...(eventTypeFilter ? { event_type: eventTypeFilter } : {}),
+      ...(severityFilter ? { severity: severityFilter } : {}),
+      ...(agentFilter ? { agent_name: agentFilter } : {}),
     }
-    if (severityFilter) {
-      timelineQuery += ' AND severity = ?'
-      timelineParams.push(severityFilter)
+    const timelineEvents = await prisma.security_events.findMany({
+      where: timelineWhere,
+      select: { created_at: true, severity: true },
+    })
+    const severityRank = (sev: string | null | undefined) => sev === 'critical' ? 3 : sev === 'warning' ? 2 : 1
+    const buckets = new Map<number, { event_count: number; max_severity: number }>()
+    for (const ev of timelineEvents as any[]) {
+      const createdAt = Number(ev.created_at)
+      if (!Number.isFinite(createdAt)) continue
+      const bucket = Math.floor(createdAt / bucketSize) * bucketSize
+      const current = buckets.get(bucket) || { event_count: 0, max_severity: 1 }
+      current.event_count += 1
+      current.max_severity = Math.max(current.max_severity, severityRank(ev.severity))
+      buckets.set(bucket, current)
     }
-    if (agentFilter) {
-      timelineQuery += ' AND agent_name = ?'
-      timelineParams.push(agentFilter)
-    }
-
-    timelineQuery += ' GROUP BY bucket ORDER BY bucket ASC'
-
-    const timeline = db.prepare(timelineQuery).all(...timelineParams) as any[]
+    const timeline = [...buckets.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([bucket, agg]) => ({ bucket, event_count: agg.event_count, max_severity: agg.max_severity }))
 
     const severityMap: Record<number, string> = { 3: 'critical', 2: 'warning', 1: 'info' }
 
@@ -179,7 +184,7 @@ export async function GET(request: NextRequest) {
         agents: agents.map((a: any) => ({
           name: a.agent_name,
           score: Math.round(a.trust_score * 100) / 100,
-          anomalies: a.anomalies,
+          anomalies: (a.auth_failures || 0) + (a.injection_attempts || 0) + (a.rate_limit_hits || 0) + (a.secret_exposures || 0),
         })),
         flaggedCount,
       },
@@ -189,12 +194,12 @@ export async function GET(request: NextRequest) {
       },
       mcpAudit: {
         totalCalls,
-        uniqueTools: mcpTotals?.unique_tools ?? 0,
+        uniqueTools: toNumber(mcpTotals?.unique_tools),
         failureRate,
-        topTools: topTools.map((t: any) => ({ name: t.tool_name, count: t.count })),
+        topTools: topTools.map((t: any) => ({ name: t.tool_name, count: toNumber(t.count) })),
       },
       rateLimits: {
-        totalHits: rateLimitEvents?.total ?? 0,
+        totalHits: rateLimitTotal,
         byIp: rateLimitByIp.map((r: any) => ({ ip: r.ip_address, count: r.count })),
       },
       injectionAttempts: {

@@ -12,8 +12,8 @@ import { createHash } from 'node:crypto'
 import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { getDatabase } from './db'
 import { logger } from './logger'
+import { getPrismaClient } from './prisma'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -115,7 +115,7 @@ function scanDiskSkills(): DiskSkill[] {
 
 export async function syncSkillsFromDisk(): Promise<{ ok: boolean; message: string }> {
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const diskSkills = scanDiskSkills()
     const now = new Date().toISOString()
 
@@ -127,9 +127,9 @@ export async function syncSkillsFromDisk(): Promise<{ ok: boolean; message: stri
 
     // Fetch current DB rows (only local sources, not registry-installed via slug)
     const localSources = ['user-agents', 'user-codex', 'project-agents', 'project-codex', 'openclaw']
-    const dbRows = db.prepare(
-      `SELECT * FROM skills WHERE source IN (${localSources.map(() => '?').join(',')})`
-    ).all(...localSources) as SkillRow[]
+    const dbRows = await prisma.skills.findMany({
+      where: { source: { in: localSources } },
+    }) as unknown as SkillRow[]
 
     const dbMap = new Map<string, SkillRow>()
     for (const r of dbRows) {
@@ -140,26 +140,35 @@ export async function syncSkillsFromDisk(): Promise<{ ok: boolean; message: stri
     let updated = 0
     let deleted = 0
 
-    const insertStmt = db.prepare(`
-      INSERT INTO skills (name, source, path, description, content_hash, installed_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `)
-    const updateStmt = db.prepare(`
-      UPDATE skills SET path = ?, description = ?, content_hash = ?, updated_at = ?
-      WHERE source = ? AND name = ?
-    `)
-    const deleteStmt = db.prepare(`DELETE FROM skills WHERE source = ? AND name = ?`)
-
-    db.transaction(() => {
+    await prisma.$transaction(async (tx) => {
       // Disk → DB: additions and changes
       for (const [key, disk] of diskMap) {
         const existing = dbMap.get(key)
         if (!existing) {
-          insertStmt.run(disk.name, disk.source, disk.path, disk.description || null, disk.contentHash, now, now)
+          await tx.skills.create({
+            data: {
+              name: disk.name,
+              source: disk.source,
+              path: disk.path,
+              description: disk.description || null,
+              content_hash: disk.contentHash,
+              installed_at: now,
+              updated_at: now,
+            },
+            select: { id: true },
+          })
           created++
         } else if (existing.content_hash !== disk.contentHash) {
           // Disk wins: content changed on disk since last sync
-          updateStmt.run(disk.path, disk.description || null, disk.contentHash, now, disk.source, disk.name)
+          await tx.skills.updateMany({
+            where: { source: disk.source, name: disk.name },
+            data: {
+              path: disk.path,
+              description: disk.description || null,
+              content_hash: disk.contentHash,
+              updated_at: now,
+            },
+          })
           updated++
         }
       }
@@ -168,11 +177,13 @@ export async function syncSkillsFromDisk(): Promise<{ ok: boolean; message: stri
       for (const [key, row] of dbMap) {
         if (!diskMap.has(key) && !row.registry_slug) {
           // Only auto-delete non-registry skills that vanished from disk
-          deleteStmt.run(row.source, row.name)
-          deleted++
+          const res = await tx.skills.deleteMany({
+            where: { source: row.source, name: row.name },
+          })
+          deleted += res.count
         }
       }
-    })()
+    })
 
     const msg = `Skill sync: ${created} added, ${updated} updated, ${deleted} removed (${diskSkills.length} on disk)`
     if (created > 0 || updated > 0 || deleted > 0) {

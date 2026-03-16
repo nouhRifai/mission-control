@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getDatabase, Task, db_helpers } from '@/lib/db'
+import { Task, db_helpers } from '@/lib/db'
 import { eventBus } from '@/lib/event-bus'
 import { requireRole } from '@/lib/auth'
 import { mutationLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
 import { validateBody, githubSyncSchema } from '@/lib/validation'
+import { getPrismaClient } from '@/lib/prisma'
 import {
   getGitHubToken,
   githubFetch,
@@ -21,7 +22,7 @@ import { initializeLabels, pullFromGitHub } from '@/lib/github-sync-engine'
  * Fetch issues from GitHub for preview before import.
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
@@ -41,7 +42,7 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'repo query parameter required (owner/repo format)' }, { status: 400 })
     }
 
-    const token = getGitHubToken()
+    const token = await getGitHubToken()
     if (!token) {
       return NextResponse.json({ error: 'GITHUB_TOKEN not configured' }, { status: 400 })
     }
@@ -62,7 +63,7 @@ export async function GET(request: NextRequest) {
  * POST /api/github — Action dispatcher for sync, comment, close, status.
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = mutationLimiter(request)
@@ -109,7 +110,7 @@ async function handleSync(
     return NextResponse.json({ error: 'repo is required' }, { status: 400 })
   }
 
-  const token = getGitHubToken()
+  const token = await getGitHubToken()
   if (!token) {
     return NextResponse.json({ error: 'GITHUB_TOKEN not configured' }, { status: 400 })
   }
@@ -120,7 +121,7 @@ async function handleSync(
     per_page: 100,
   })
 
-  const db = getDatabase()
+  const prisma = getPrismaClient()
   const now = Math.floor(Date.now() / 1000)
   let imported = 0
   let skipped = 0
@@ -130,12 +131,10 @@ async function handleSync(
   for (const issue of issues) {
     try {
       // Check for duplicate: existing task with same github_repo + github_issue_number
-      const existing = db.prepare(`
-        SELECT id FROM tasks
-        WHERE json_extract(metadata, '$.github_repo') = ?
-          AND json_extract(metadata, '$.github_issue_number') = ?
-          AND workspace_id = ?
-      `).get(repo, issue.number, workspaceId) as { id: number } | undefined
+      const existing = await prisma.tasks.findFirst({
+        where: { workspace_id: workspaceId, github_repo: repo, github_issue_number: issue.number },
+        select: { id: true },
+      })
 
       if (existing) {
         skipped++
@@ -155,28 +154,26 @@ async function handleSync(
         github_state: issue.state,
       }
 
-      const stmt = db.prepare(`
-        INSERT INTO tasks (
-          title, description, status, priority, assigned_to, created_by,
-          created_at, updated_at, tags, metadata, workspace_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `)
+      const created = (await prisma.tasks.create({
+        data: {
+          title: issue.title,
+          description: issue.body || '',
+          status,
+          priority,
+          assigned_to: body.assignAgent || null,
+          created_by: actor,
+          created_at: now,
+          updated_at: now,
+          tags: JSON.stringify(tags),
+          metadata: JSON.stringify(metadata),
+          workspace_id: workspaceId,
+          github_repo: repo,
+          github_issue_number: issue.number,
+          github_synced_at: now,
+        } as any,
+      })) as unknown as Task
 
-      const dbResult = stmt.run(
-        issue.title,
-        issue.body || '',
-        status,
-        priority,
-        body.assignAgent || null,
-        actor,
-        now,
-        now,
-        JSON.stringify(tags),
-        JSON.stringify(metadata),
-        workspaceId
-      )
-
-      const taskId = dbResult.lastInsertRowid as number
+      const taskId = created.id
 
       db_helpers.logActivity(
         'task_created',
@@ -188,11 +185,10 @@ async function handleSync(
         workspaceId
       )
 
-      const createdTask = db.prepare('SELECT * FROM tasks WHERE id = ? AND workspace_id = ?').get(taskId, workspaceId) as Task
       const parsedTask = {
-        ...createdTask,
-        tags: JSON.parse(createdTask.tags || '[]'),
-        metadata: JSON.parse(createdTask.metadata || '{}'),
+        ...created,
+        tags: JSON.parse(created.tags || '[]'),
+        metadata: JSON.parse(created.metadata || '{}'),
       }
 
       eventBus.broadcast('task.created', parsedTask)
@@ -205,33 +201,20 @@ async function handleSync(
   }
 
   // Log sync to github_syncs table
-  const syncTableHasWorkspace = db
-    .prepare("SELECT 1 as ok FROM pragma_table_info('github_syncs') WHERE name = 'workspace_id'")
-    .get() as { ok?: number } | undefined
-  if (syncTableHasWorkspace?.ok) {
-    db.prepare(`
-      INSERT INTO github_syncs (repo, last_synced_at, issue_count, sync_direction, status, error, workspace_id)
-      VALUES (?, ?, ?, 'inbound', ?, ?, ?)
-    `).run(
+  await prisma.github_syncs.create({
+    data: {
       repo,
-      now,
-      imported,
-      errors > 0 ? 'partial' : 'success',
-      errors > 0 ? `${errors} issues failed to import` : null,
-      workspaceId
-    )
-  } else {
-    db.prepare(`
-      INSERT INTO github_syncs (repo, last_synced_at, issue_count, sync_direction, status, error)
-      VALUES (?, ?, ?, 'inbound', ?, ?)
-    `).run(
-      repo,
-      now,
-      imported,
-      errors > 0 ? 'partial' : 'success',
-      errors > 0 ? `${errors} issues failed to import` : null
-    )
-  }
+      last_synced_at: now,
+      issue_count: imported,
+      sync_direction: 'inbound',
+      status: errors > 0 ? 'partial' : 'success',
+      error: errors > 0 ? `${errors} issues failed to import` : null,
+      workspace_id: workspaceId,
+    } as any,
+    select: { id: true },
+  }).catch(() => {
+    // best-effort; sync logging should not break the import path
+  })
 
   eventBus.broadcast('github.synced', {
     repo,
@@ -300,16 +283,21 @@ async function handleClose(
   await updateIssueState(body.repo, body.issueNumber, 'closed')
 
   // Update local task metadata if we have a linked task
-  const db = getDatabase()
+  const prisma = getPrismaClient()
   const now = Math.floor(Date.now() / 1000)
-  db.prepare(`
-    UPDATE tasks
-    SET metadata = json_set(metadata, '$.github_state', 'closed'),
-        updated_at = ?
-    WHERE json_extract(metadata, '$.github_repo') = ?
-      AND json_extract(metadata, '$.github_issue_number') = ?
-      AND workspace_id = ?
-  `).run(now, body.repo, body.issueNumber, workspaceId)
+  const existing = await prisma.tasks.findFirst({
+    where: { workspace_id: workspaceId, github_repo: body.repo, github_issue_number: body.issueNumber },
+    select: { id: true, metadata: true },
+  })
+  if (existing) {
+    let meta: any = {}
+    try { meta = existing.metadata ? JSON.parse(existing.metadata) : {} } catch { meta = {} }
+    meta.github_state = 'closed'
+    await prisma.tasks.updateMany({
+      where: { id: existing.id, workspace_id: workspaceId },
+      data: { metadata: JSON.stringify(meta), updated_at: now } as any,
+    })
+  }
 
   db_helpers.logActivity(
     'github_close',
@@ -326,25 +314,20 @@ async function handleClose(
 
 // ── Status: return recent sync history ──────────────────────────
 
-function handleStatus(workspaceId: number) {
-  const db = getDatabase()
-  const tableHasWorkspace = db
-    .prepare("SELECT 1 as ok FROM pragma_table_info('github_syncs') WHERE name = 'workspace_id'")
-    .get() as { ok?: number } | undefined
-  const syncs = db.prepare(`
-    SELECT * FROM github_syncs
-    ${tableHasWorkspace?.ok ? 'WHERE workspace_id = ?' : ''}
-    ORDER BY created_at DESC
-    LIMIT 20
-  `).all(...(tableHasWorkspace?.ok ? [workspaceId] : []))
-
+async function handleStatus(workspaceId: number) {
+  const prisma = getPrismaClient()
+  const syncs = await prisma.github_syncs.findMany({
+    where: { workspace_id: workspaceId } as any,
+    orderBy: { created_at: 'desc' },
+    take: 20,
+  })
   return NextResponse.json({ syncs })
 }
 
 // ── Stats: GitHub user profile + repo overview ──────────────────
 
 async function handleGitHubStats() {
-  const token = getGitHubToken()
+  const token = await getGitHubToken()
   if (!token) {
     return NextResponse.json({ error: 'GITHUB_TOKEN not configured' }, { status: 400 })
   }
@@ -436,12 +419,12 @@ async function handleInitLabels(
   await initializeLabels(repo)
 
   // Mark project labels as initialized
-  const db = getDatabase()
-  db.prepare(`
-    UPDATE projects
-    SET github_labels_initialized = 1, updated_at = unixepoch()
-    WHERE github_repo = ? AND workspace_id = ?
-  `).run(repo, workspaceId)
+  const prisma = getPrismaClient()
+  const now = Math.floor(Date.now() / 1000)
+  await prisma.projects.updateMany({
+    where: { github_repo: repo, workspace_id: workspaceId },
+    data: { github_labels_initialized: 1, updated_at: now } as any,
+  })
 
   return NextResponse.json({ ok: true, repo })
 }
@@ -457,12 +440,11 @@ async function handleSyncProject(
     return NextResponse.json({ error: 'project_id is required' }, { status: 400 })
   }
 
-  const db = getDatabase()
-  const project = db.prepare(`
-    SELECT id, github_repo, github_sync_enabled, github_default_branch
-    FROM projects
-    WHERE id = ? AND workspace_id = ? AND status = 'active'
-  `).get(body.project_id, workspaceId) as any | undefined
+  const prisma = getPrismaClient()
+  const project = await prisma.projects.findFirst({
+    where: { id: body.project_id, workspace_id: workspaceId, status: 'active' },
+    select: { id: true, github_repo: true, github_sync_enabled: true, github_default_branch: true },
+  }) as any | null
 
   if (!project) {
     return NextResponse.json({ error: 'Project not found' }, { status: 404 })

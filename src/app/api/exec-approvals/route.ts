@@ -22,7 +22,7 @@ function computeHash(raw: string): string {
  * GET /api/exec-approvals?action=allowlist - Fetch per-agent allowlists
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const action = request.nextUrl.searchParams.get('action')
@@ -91,7 +91,7 @@ async function getAllowlist(): Promise<NextResponse> {
  * Body: { agents: Record<string, { pattern: string }[]>, hash?: string }
  */
 export async function PUT(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   let body: { agents: Record<string, { pattern: string }[]>; hash?: string }
@@ -161,7 +161,7 @@ export async function PUT(request: NextRequest) {
  * Body: { id: string, action: 'approve' | 'deny' | 'always_allow', reason?: string }
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   let body: { id: string; action: string; reason?: string }

@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getDatabase, db_helpers } from '@/lib/db'
+import { db_helpers } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { validateBody, connectSchema } from '@/lib/validation'
 import { eventBus } from '@/lib/event-bus'
 import { randomUUID } from 'crypto'
+import { getPrismaClient } from '@/lib/prisma'
 
 /**
  * POST /api/connect — Register a direct CLI connection
@@ -12,46 +13,67 @@ import { randomUUID } from 'crypto'
  * for the same agent, and returns connection details + helper URLs.
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const validation = await validateBody(request, connectSchema)
   if ('error' in validation) return validation.error
 
   const { tool_name, tool_version, agent_name, agent_role, metadata } = validation.data
-  const db = getDatabase()
+  const prisma = getPrismaClient()
   const now = Math.floor(Date.now() / 1000)
   const workspaceId = auth.user.workspace_id ?? 1;
 
   // Find or create agent
-  let agent = db.prepare('SELECT * FROM agents WHERE name = ? AND workspace_id = ?').get(agent_name, workspaceId) as any
+  let agent = await prisma.agents.findFirst({
+    where: { name: agent_name, workspace_id: workspaceId },
+  }) as any
   if (!agent) {
-    const result = db.prepare(
-      `INSERT INTO agents (name, role, status, created_at, updated_at, workspace_id)
-       VALUES (?, ?, 'online', ?, ?, ?)`
-    ).run(agent_name, agent_role || 'cli', now, now, workspaceId)
-    agent = { id: result.lastInsertRowid, name: agent_name }
+    agent = await prisma.agents.create({
+      data: {
+        name: agent_name,
+        role: agent_role || 'cli',
+        status: 'online',
+        created_at: now,
+        updated_at: now,
+        workspace_id: workspaceId,
+      } as any,
+    })
     db_helpers.logActivity('agent_created', 'agent', agent.id as number, 'system',
       `Auto-created agent "${agent_name}" via direct CLI connection`, undefined, workspaceId)
     eventBus.broadcast('agent.created', { id: agent.id, name: agent_name })
   } else {
     // Set agent online
-    db.prepare('UPDATE agents SET status = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')
-      .run('online', now, agent.id, workspaceId)
+    await prisma.agents.updateMany({
+      where: { id: agent.id, workspace_id: workspaceId },
+      data: { status: 'online', updated_at: now } as any,
+    })
     eventBus.broadcast('agent.status_changed', { id: agent.id, name: agent.name, status: 'online' })
   }
 
   // Deactivate previous connections for this agent
-  db.prepare(
-    `UPDATE direct_connections SET status = 'disconnected', updated_at = ? WHERE agent_id = ? AND status = 'connected'`
-  ).run(now, agent.id)
+  await prisma.direct_connections.updateMany({
+    where: { agent_id: agent.id, status: 'connected' },
+    data: { status: 'disconnected', updated_at: now } as any,
+  })
 
   // Create new connection
   const connectionId = randomUUID()
-  db.prepare(
-    `INSERT INTO direct_connections (agent_id, tool_name, tool_version, connection_id, status, last_heartbeat, metadata, created_at, updated_at, workspace_id)
-     VALUES (?, ?, ?, ?, 'connected', ?, ?, ?, ?, ?)`
-  ).run(agent.id, tool_name, tool_version || null, connectionId, now, metadata ? JSON.stringify(metadata) : null, now, now, workspaceId)
+  await prisma.direct_connections.create({
+    data: {
+      agent_id: agent.id,
+      tool_name,
+      tool_version: tool_version || null,
+      connection_id: connectionId,
+      status: 'connected',
+      last_heartbeat: now,
+      metadata: metadata ? JSON.stringify(metadata) : null,
+      created_at: now,
+      updated_at: now,
+      workspace_id: workspaceId,
+    } as any,
+    select: { id: true },
+  })
 
   db_helpers.logActivity('connection_created', 'agent', agent.id as number, agent_name,
     `CLI connection established via ${tool_name}${tool_version ? ` v${tool_version}` : ''}`, undefined, workspaceId)
@@ -78,27 +100,34 @@ export async function POST(request: NextRequest) {
  * GET /api/connect — List all direct connections
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
-  const db = getDatabase()
+  const prisma = getPrismaClient()
   const workspaceId = auth.user.workspace_id ?? 1;
-  const connections = db.prepare(`
-    SELECT dc.*, a.name as agent_name, a.status as agent_status, a.role as agent_role
-    FROM direct_connections dc
-    JOIN agents a ON dc.agent_id = a.id
-    WHERE a.workspace_id = ?
-    ORDER BY dc.created_at DESC
-  `).all(workspaceId)
+  const connections = await prisma.direct_connections.findMany({
+    where: { workspace_id: workspaceId },
+    include: {
+      agents: { select: { name: true, status: true, role: true, workspace_id: true } },
+    },
+    orderBy: { created_at: 'desc' },
+  })
 
-  return NextResponse.json({ connections })
+  return NextResponse.json({
+    connections: (connections as any[]).map((dc) => ({
+      ...dc,
+      agent_name: dc.agents?.name,
+      agent_status: dc.agents?.status,
+      agent_role: dc.agents?.role,
+    })),
+  })
 }
 
 /**
  * DELETE /api/connect — Disconnect by connection_id
  */
 export async function DELETE(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   let body: any
@@ -113,40 +142,42 @@ export async function DELETE(request: NextRequest) {
     return NextResponse.json({ error: 'connection_id is required' }, { status: 400 })
   }
 
-  const db = getDatabase()
+  const prisma = getPrismaClient()
   const now = Math.floor(Date.now() / 1000)
   const workspaceId = auth.user.workspace_id ?? 1;
 
-  const conn = db.prepare(`
-    SELECT dc.*
-    FROM direct_connections dc
-    JOIN agents a ON a.id = dc.agent_id
-    WHERE dc.connection_id = ? AND a.workspace_id = ?
-  `).get(connection_id, workspaceId) as any
+  const conn = await prisma.direct_connections.findFirst({
+    where: { connection_id, workspace_id: workspaceId },
+    include: { agents: { select: { id: true, name: true, workspace_id: true } } },
+  }) as any
   if (!conn) {
     return NextResponse.json({ error: 'Connection not found' }, { status: 404 })
   }
 
-  db.prepare('UPDATE direct_connections SET status = ?, updated_at = ? WHERE connection_id = ?')
-    .run('disconnected', now, connection_id)
+  await prisma.direct_connections.updateMany({
+    where: { connection_id, workspace_id: workspaceId },
+    data: { status: 'disconnected', updated_at: now } as any,
+  })
 
   // Check if agent has other active connections; if not, set offline
-  const otherActive = db.prepare(
-    'SELECT COUNT(*) as count FROM direct_connections WHERE agent_id = ? AND status = ? AND connection_id != ?'
-  ).get(conn.agent_id, 'connected', connection_id) as any
-  if (!otherActive?.count) {
-    db.prepare('UPDATE agents SET status = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')
-      .run('offline', now, conn.agent_id, workspaceId)
+  const otherActiveCount = await prisma.direct_connections.count({
+    where: { agent_id: conn.agent_id, status: 'connected', connection_id: { not: connection_id } },
+  })
+  if (!otherActiveCount) {
+    await prisma.agents.updateMany({
+      where: { id: conn.agent_id, workspace_id: workspaceId },
+      data: { status: 'offline', updated_at: now } as any,
+    })
   }
 
-  const agent = db.prepare('SELECT name FROM agents WHERE id = ? AND workspace_id = ?').get(conn.agent_id, workspaceId) as any
-  db_helpers.logActivity('connection_disconnected', 'agent', conn.agent_id, agent?.name || 'unknown',
+  const agentName = conn.agents?.name || 'unknown'
+  db_helpers.logActivity('connection_disconnected', 'agent', conn.agent_id, agentName,
     `CLI connection disconnected (${conn.tool_name})`, undefined, workspaceId)
 
   eventBus.broadcast('connection.disconnected', {
     connection_id,
     agent_id: conn.agent_id,
-    agent_name: agent?.name,
+    agent_name: agentName,
   })
 
   return NextResponse.json({ status: 'disconnected', connection_id })

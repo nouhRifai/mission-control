@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDatabase, Comment, db_helpers } from '@/lib/db';
+import { Comment, db_helpers } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
 import { validateBody, createCommentSchema } from '@/lib/validation';
 import { mutationLimiter } from '@/lib/rate-limit';
 import { logger } from '@/lib/logger';
-import { resolveMentionRecipients } from '@/lib/mentions';
+import { resolveMentionRecipientsAsync } from '@/lib/mentions';
+import { getPrismaClient } from '@/lib/prisma';
 
 /**
  * GET /api/tasks/[id]/comments - Get all comments for a task
@@ -13,11 +14,11 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'viewer');
+  const auth = await requireRole(request, 'viewer');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const resolvedParams = await params;
     const taskId = parseInt(resolvedParams.id);
     const workspaceId = auth.user.workspace_id ?? 1;
@@ -27,21 +28,19 @@ export async function GET(
     }
     
     // Verify task exists
-    const task = db
-      .prepare('SELECT id FROM tasks WHERE id = ? AND workspace_id = ?')
-      .get(taskId, workspaceId);
+    const task = await prisma.tasks.findFirst({
+      where: { id: taskId, workspace_id: workspaceId },
+      select: { id: true },
+    })
     if (!task) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 });
     }
     
     // Get comments ordered by creation time
-    const stmt = db.prepare(`
-      SELECT * FROM comments 
-      WHERE task_id = ? AND workspace_id = ?
-      ORDER BY created_at ASC
-    `);
-    
-    const comments = stmt.all(taskId, workspaceId) as Comment[];
+    const comments = await prisma.comments.findMany({
+      where: { task_id: taskId, workspace_id: workspaceId },
+      orderBy: { created_at: 'asc' },
+    }) as unknown as Comment[];
     
     // Parse JSON fields and build thread structure
     const commentsWithParsedData = comments.map(comment => ({
@@ -91,14 +90,14 @@ export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'operator');
+  const auth = await requireRole(request, 'operator');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   const rateCheck = mutationLimiter(request);
   if (rateCheck) return rateCheck;
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const resolvedParams = await params;
     const taskId = parseInt(resolvedParams.id);
     const workspaceId = auth.user.workspace_id ?? 1;
@@ -135,24 +134,25 @@ export async function POST(
     }
 
     // Verify task exists
-    const task = db
-      .prepare('SELECT * FROM tasks WHERE id = ? AND workspace_id = ?')
-      .get(taskId, workspaceId) as any;
+    const task = await prisma.tasks.findFirst({
+      where: { id: taskId, workspace_id: workspaceId },
+    }) as any;
     if (!task) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 });
     }
     
     // Verify parent comment exists if specified
     if (parent_id) {
-      const parentComment = db
-        .prepare('SELECT id FROM comments WHERE id = ? AND task_id = ? AND workspace_id = ?')
-        .get(parent_id, taskId, workspaceId);
+      const parentComment = await prisma.comments.findFirst({
+        where: { id: parent_id, task_id: taskId, workspace_id: workspaceId },
+        select: { id: true },
+      })
       if (!parentComment) {
         return NextResponse.json({ error: 'Parent comment not found' }, { status: 404 });
       }
     }
     
-    const mentionResolution = resolveMentionRecipients(content, db, workspaceId);
+    const mentionResolution = await resolveMentionRecipientsAsync(content, workspaceId);
     if (mentionResolution.unresolved.length > 0) {
       return NextResponse.json({
         error: `Unknown mentions: ${mentionResolution.unresolved.map((m) => `@${m}`).join(', ')}`,
@@ -163,22 +163,19 @@ export async function POST(
     const now = Math.floor(Date.now() / 1000);
     
     // Insert comment
-    const stmt = db.prepare(`
-      INSERT INTO comments (task_id, author, content, created_at, parent_id, mentions, workspace_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `);
-    
-    const insertResult = stmt.run(
-      taskId,
-      author,
-      content,
-      now,
-      parent_id || null,
-      mentionResolution.tokens.length > 0 ? JSON.stringify(mentionResolution.tokens) : null,
-      workspaceId
-    );
-
-    const commentId = insertResult.lastInsertRowid as number;
+    const created = await prisma.comments.create({
+      data: {
+        task_id: taskId,
+        author,
+        content,
+        created_at: now,
+        parent_id: parent_id || null,
+        mentions: mentionResolution.tokens.length > 0 ? JSON.stringify(mentionResolution.tokens) : null,
+        workspace_id: workspaceId,
+      } as any,
+      select: { id: true },
+    })
+    const commentId = created.id
     
     // Log activity
     const activityDescription = parent_id 
@@ -212,7 +209,7 @@ export async function POST(
     }
 
     // Notify subscribers
-    const subscribers = new Set(db_helpers.getTaskSubscribers(taskId, workspaceId));
+    const subscribers = new Set(await db_helpers.getTaskSubscribers(taskId, workspaceId));
     subscribers.delete(author);
     const mentionSet = new Set(mentionRecipients);
 
@@ -232,9 +229,10 @@ export async function POST(
     }
     
     // Fetch the created comment
-    const createdComment = db
-      .prepare('SELECT * FROM comments WHERE id = ? AND workspace_id = ?')
-      .get(commentId, workspaceId) as Comment;
+    const createdComment = await prisma.comments.findFirst({
+      where: { id: commentId, workspace_id: workspaceId },
+    }) as unknown as Comment | null;
+    if (!createdComment) throw new Error('Comment not found after create')
     
     return NextResponse.json({ 
       comment: {

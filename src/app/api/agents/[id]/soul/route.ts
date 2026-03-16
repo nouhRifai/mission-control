@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDatabase, db_helpers } from '@/lib/db';
+import { db_helpers } from '@/lib/db';
 import { readFileSync, existsSync, readdirSync, writeFileSync, mkdirSync } from 'fs';
 import { join, dirname, isAbsolute, resolve } from 'path';
 import { config } from '@/lib/config';
@@ -7,12 +7,7 @@ import { resolveWithin } from '@/lib/paths';
 import { getAgentWorkspaceCandidates, readAgentWorkspaceFile } from '@/lib/agent-workspace';
 import { requireRole } from '@/lib/auth';
 import { logger } from '@/lib/logger';
-
-function resolveAgentWorkspacePath(workspace: string): string {
-  if (isAbsolute(workspace)) return resolve(workspace)
-  if (!config.openclawStateDir) throw new Error('OPENCLAW_STATE_DIR not configured')
-  return resolveWithin(config.openclawStateDir, workspace)
-}
+import { getPrismaClient } from '@/lib/prisma';
 
 /**
  * GET /api/agents/[id]/soul - Get agent's SOUL content
@@ -21,11 +16,11 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const resolvedParams = await params;
     const agentId = resolvedParams.id;
     const workspaceId = auth.user.workspace_id ?? 1;
@@ -33,9 +28,9 @@ export async function GET(
     // Get agent by ID or name
     let agent: any;
     if (isNaN(Number(agentId))) {
-      agent = db.prepare('SELECT * FROM agents WHERE name = ? AND workspace_id = ?').get(agentId, workspaceId);
+      agent = await prisma.agents.findFirst({ where: { name: agentId, workspace_id: workspaceId } });
     } else {
-      agent = db.prepare('SELECT * FROM agents WHERE id = ? AND workspace_id = ?').get(Number(agentId), workspaceId);
+      agent = await prisma.agents.findFirst({ where: { id: Number(agentId), workspace_id: workspaceId } });
     }
     
     if (!agent) {
@@ -102,11 +97,11 @@ export async function PUT(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'operator');
+  const auth = await requireRole(request, 'operator');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const resolvedParams = await params;
     const agentId = resolvedParams.id;
     const workspaceId = auth.user.workspace_id ?? 1;
@@ -116,9 +111,9 @@ export async function PUT(
     // Get agent by ID or name
     let agent: any;
     if (isNaN(Number(agentId))) {
-      agent = db.prepare('SELECT * FROM agents WHERE name = ? AND workspace_id = ?').get(agentId, workspaceId);
+      agent = await prisma.agents.findFirst({ where: { name: agentId, workspace_id: workspaceId } });
     } else {
-      agent = db.prepare('SELECT * FROM agents WHERE id = ? AND workspace_id = ?').get(Number(agentId), workspaceId);
+      agent = await prisma.agents.findFirst({ where: { id: Number(agentId), workspace_id: workspaceId } });
     }
     
     if (!agent) {
@@ -175,13 +170,11 @@ export async function PUT(
     }
 
     // Update SOUL content in DB
-    const updateStmt = db.prepare(`
-      UPDATE agents
-      SET soul_content = ?, updated_at = ?
-      WHERE ${isNaN(Number(agentId)) ? 'name' : 'id'} = ? AND workspace_id = ?
-    `);
-
-    updateStmt.run(newSoulContent, now, agentId, workspaceId);
+    await prisma.agents.update({
+      where: { id: agent.id },
+      data: { soul_content: newSoulContent, updated_at: now },
+      select: { id: true },
+    })
 
     // Log activity
     db_helpers.logActivity(

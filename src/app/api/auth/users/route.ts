@@ -9,15 +9,15 @@ import { logger } from '@/lib/logger'
  * GET /api/auth/users - List all users (admin only)
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
-  const user = getUserFromRequest(request)
+  const user = await getUserFromRequest(request)
   if (!user || user.role !== 'admin') {
     return NextResponse.json({ error: 'Admin access required' }, { status: 403 })
   }
 
-  const users = getAllUsers()
+  const users = await getAllUsers()
   const workspaceId = user.workspace_id ?? 1
   return NextResponse.json({ users: users.filter((u) => (u.workspace_id ?? 1) === workspaceId) })
 }
@@ -26,7 +26,7 @@ export async function GET(request: NextRequest) {
  * POST /api/auth/users - Create a new user (admin only)
  */
 export async function POST(request: NextRequest) {
-  const currentUser = getUserFromRequest(request)
+  const currentUser = await getUserFromRequest(request)
   if (!currentUser || currentUser.role !== 'admin') {
     return NextResponse.json({ error: 'Admin access required' }, { status: 403 })
   }
@@ -40,7 +40,7 @@ export async function POST(request: NextRequest) {
     const { username, password, display_name, role, provider, email } = result.data
 
     const workspaceId = currentUser.workspace_id ?? 1
-    const newUser = createUser(username, password, display_name || username, role, {
+    const newUser = await createUser(username, password, display_name || username, role, {
       provider,
       email: email || null,
       workspace_id: workspaceId,
@@ -80,7 +80,7 @@ export async function POST(request: NextRequest) {
  * PUT /api/auth/users - Update a user (admin only)
  */
 export async function PUT(request: NextRequest) {
-  const currentUser = getUserFromRequest(request)
+  const currentUser = await getUserFromRequest(request)
   if (!currentUser || currentUser.role !== 'admin') {
     return NextResponse.json({ error: 'Admin access required' }, { status: 403 })
   }
@@ -103,12 +103,12 @@ export async function PUT(request: NextRequest) {
     }
 
     const workspaceId = currentUser.workspace_id ?? 1
-    const existing = getUserById(userId)
+    const existing = await getUserById(userId)
     if (!existing || (existing.workspace_id ?? 1) !== workspaceId) {
       return NextResponse.json({ error: 'User not found' }, { status: 404 })
     }
 
-    const updated = updateUser(userId, { display_name, role, password: password || undefined, is_approved, email, avatar_url })
+    const updated = await updateUser(userId, { display_name, role, password: password || undefined, is_approved, email, avatar_url })
     if (!updated) {
       return NextResponse.json({ error: 'User not found' }, { status: 404 })
     }
@@ -144,7 +144,7 @@ export async function PUT(request: NextRequest) {
  * DELETE /api/auth/users - Delete a user (admin only)
  */
 export async function DELETE(request: NextRequest) {
-  const currentUser = getUserFromRequest(request)
+  const currentUser = await getUserFromRequest(request)
   if (!currentUser || currentUser.role !== 'admin') {
     return NextResponse.json({ error: 'Admin access required' }, { status: 403 })
   }
@@ -165,12 +165,12 @@ export async function DELETE(request: NextRequest) {
   }
 
   const workspaceId = currentUser.workspace_id ?? 1
-  const existing = getUserById(userId)
+  const existing = await getUserById(userId)
   if (!existing || (existing.workspace_id ?? 1) !== workspaceId) {
     return NextResponse.json({ error: 'User not found' }, { status: 404 })
   }
 
-  const deleted = deleteUser(userId)
+  const deleted = await deleteUser(userId)
   if (!deleted) {
     return NextResponse.json({ error: 'User not found' }, { status: 404 })
   }

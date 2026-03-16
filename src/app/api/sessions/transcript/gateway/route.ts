@@ -18,7 +18,7 @@ import { callOpenClawGateway } from '@/lib/openclaw-gateway'
  * the sessionId from the agent's sessions.json, then the JSONL file is read.
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const { searchParams } = new URL(request.url)

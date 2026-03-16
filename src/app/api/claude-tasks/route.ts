@@ -7,7 +7,7 @@ import { getClaudeCodeTasks } from '@/lib/claude-tasks'
  * Read-only bridge: MC reads from ~/.claude/tasks/ and ~/.claude/teams/
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const force = request.nextUrl.searchParams.get('force') === 'true'

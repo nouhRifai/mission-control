@@ -1,9 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDatabase, Agent, db_helpers } from '@/lib/db';
+import { Agent, db_helpers, logAuditEvent } from '@/lib/db';
 import { eventBus } from '@/lib/event-bus';
 import { getTemplate, buildAgentConfig } from '@/lib/agent-templates';
 import { writeAgentToConfig, enrichAgentConfigFromWorkspace } from '@/lib/agent-sync';
-import { logAuditEvent } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
 import { mutationLimiter } from '@/lib/rate-limit';
 import { logger } from '@/lib/logger';
@@ -12,17 +11,19 @@ import { runOpenClaw } from '@/lib/command';
 import { config as appConfig } from '@/lib/config';
 import { resolveWithin } from '@/lib/paths';
 import path from 'node:path';
+import { getPrismaClient } from '@/lib/prisma';
+import { Prisma } from '@/generated/prisma/sqlite';
 
 /**
  * GET /api/agents - List all agents with optional filtering
  * Query params: status, role, limit, offset
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const { searchParams } = new URL(request.url);
     const workspaceId = auth.user.workspace_id ?? 1;
     
@@ -32,30 +33,26 @@ export async function GET(request: NextRequest) {
     const limit = Math.min(parseInt(searchParams.get('limit') || '50'), 200);
     const offset = parseInt(searchParams.get('offset') || '0');
     
-    // Build dynamic query
-    let query = 'SELECT * FROM agents WHERE workspace_id = ?';
-    const params: any[] = [workspaceId];
-    
-    if (status) {
-      query += ' AND status = ?';
-      params.push(status);
+    const where: any = {
+      workspace_id: workspaceId,
+      ...(status ? { status } : {}),
+      ...(role ? { role } : {}),
     }
-    
-    if (role) {
-      query += ' AND role = ?';
-      params.push(role);
-    }
-    
-    query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
-    params.push(limit, offset);
-    
-    const stmt = db.prepare(query);
-    const agents = stmt.all(...params) as Agent[];
+
+    const [agents, total] = await Promise.all([
+      prisma.agents.findMany({
+        where,
+        orderBy: { created_at: 'desc' },
+        take: limit,
+        skip: offset,
+      }),
+      prisma.agents.count({ where }),
+    ])
     
     // Parse JSON config field
-    const agentsWithParsedData = agents.map(agent => ({
+    const agentsWithParsedData = (agents as any[]).map((agent) => ({
       ...agent,
-      config: enrichAgentConfigFromWorkspace(agent.config ? JSON.parse(agent.config) : {})
+      config: enrichAgentConfigFromWorkspace(agent.config ? JSON.parse(agent.config) : {}),
     }));
     
     // Get task counts for all listed agents in one query (avoids N+1 queries)
@@ -63,8 +60,7 @@ export async function GET(request: NextRequest) {
     const taskStatsByAgent = new Map<string, { total: number; assigned: number; in_progress: number; quality_review: number; done: number }>()
 
     if (agentNames.length > 0) {
-      const placeholders = agentNames.map(() => '?').join(', ')
-      const groupedTaskStats = db.prepare(`
+      const groupedTaskStats = await prisma.$queryRaw<any[]>`
         SELECT
           assigned_to,
           COUNT(*) as total,
@@ -73,24 +69,18 @@ export async function GET(request: NextRequest) {
           SUM(CASE WHEN status = 'quality_review' THEN 1 ELSE 0 END) as quality_review,
           SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) as done
         FROM tasks
-        WHERE workspace_id = ? AND assigned_to IN (${placeholders})
+        WHERE workspace_id = ${workspaceId} AND assigned_to IN (${Prisma.join(agentNames)})
         GROUP BY assigned_to
-      `).all(workspaceId, ...agentNames) as Array<{
-        assigned_to: string
-        total: number | null
-        assigned: number | null
-        in_progress: number | null
-        quality_review: number | null
-        done: number | null
-      }>
+      `
 
+      const toNum = (v: any) => (typeof v === 'bigint' ? Number(v) : (Number.isFinite(Number(v)) ? Number(v) : 0))
       for (const row of groupedTaskStats) {
-        taskStatsByAgent.set(row.assigned_to, {
-          total: row.total || 0,
-          assigned: row.assigned || 0,
-          in_progress: row.in_progress || 0,
-          quality_review: row.quality_review || 0,
-          done: row.done || 0,
+        taskStatsByAgent.set(String(row.assigned_to), {
+          total: toNum(row.total),
+          assigned: toNum(row.assigned),
+          in_progress: toNum(row.in_progress),
+          quality_review: toNum(row.quality_review),
+          done: toNum(row.done),
         })
       }
     }
@@ -113,22 +103,9 @@ export async function GET(request: NextRequest) {
       };
     });
     
-    // Get total count for pagination
-    let countQuery = 'SELECT COUNT(*) as total FROM agents WHERE workspace_id = ?';
-    const countParams: any[] = [workspaceId];
-    if (status) {
-      countQuery += ' AND status = ?';
-      countParams.push(status);
-    }
-    if (role) {
-      countQuery += ' AND role = ?';
-      countParams.push(role);
-    }
-    const countRow = db.prepare(countQuery).get(...countParams) as { total: number };
-
     return NextResponse.json({
       agents: agentsWithStats,
-      total: countRow.total,
+      total,
       page: Math.floor(offset / limit) + 1,
       limit
     });
@@ -142,14 +119,14 @@ export async function GET(request: NextRequest) {
  * POST /api/agents - Create a new agent
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator');
+  const auth = await requireRole(request, 'operator');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   const rateCheck = mutationLimiter(request);
   if (rateCheck) return rateCheck;
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const workspaceId = auth.user.workspace_id ?? 1;
     const validated = await validateBody(request, createAgentSchema);
     if ('error' in validated) return validated.error;
@@ -194,9 +171,10 @@ export async function POST(request: NextRequest) {
     }
 
     // Check if agent name already exists
-    const existingAgent = db
-      .prepare('SELECT id FROM agents WHERE name = ? AND workspace_id = ?')
-      .get(name, workspaceId);
+    const existingAgent = await prisma.agents.findFirst({
+      where: { name, workspace_id: workspaceId },
+      select: { id: true },
+    })
     if (existingAgent) {
       return NextResponse.json({ error: 'Agent name already exists' }, { status: 409 });
     }
@@ -228,27 +206,21 @@ export async function POST(request: NextRequest) {
     }
     
     const now = Math.floor(Date.now() / 1000);
-    
-    const stmt = db.prepare(`
-      INSERT INTO agents (
-        name, role, session_key, soul_content, status, 
-        created_at, updated_at, config, workspace_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    
-    const dbResult = stmt.run(
-      name,
-      finalRole,
-      session_key,
-      soul_content,
-      status,
-      now,
-      now,
-      JSON.stringify(finalConfig),
-      workspaceId
-    );
-
-    const agentId = dbResult.lastInsertRowid as number;
+    const created = await prisma.agents.create({
+      data: {
+        name,
+        role: finalRole,
+        session_key: session_key ?? null,
+        soul_content: soul_content ?? null,
+        status,
+        created_at: now,
+        updated_at: now,
+        config: JSON.stringify(finalConfig),
+        workspace_id: workspaceId,
+      } as any,
+      select: { id: true },
+    })
+    const agentId = created.id
     
     // Log activity
     db_helpers.logActivity(
@@ -268,14 +240,15 @@ export async function POST(request: NextRequest) {
     );
     
     // Fetch the created agent
-    const createdAgent = db
-      .prepare('SELECT * FROM agents WHERE id = ? AND workspace_id = ?')
-      .get(agentId, workspaceId) as Agent;
+    const createdAgent = await prisma.agents.findFirst({
+      where: { id: agentId, workspace_id: workspaceId },
+    }) as unknown as Agent | null
+    if (!createdAgent) throw new Error('Agent not found after create')
     const parsedAgent = {
-      ...createdAgent,
-      config: JSON.parse(createdAgent.config || '{}'),
-      taskStats: { total: 0, assigned: 0, in_progress: 0, quality_review: 0, done: 0, completed: 0 }
-    };
+      ...(createdAgent as any),
+      config: JSON.parse((createdAgent as any).config || '{}'),
+      taskStats: { total: 0, assigned: 0, in_progress: 0, quality_review: 0, done: 0, completed: 0 },
+    }
 
     // Broadcast to SSE clients
     eventBus.broadcast('agent.created', parsedAgent);
@@ -324,14 +297,14 @@ export async function POST(request: NextRequest) {
  * PUT /api/agents - Update agent status (bulk operation for status updates)
  */
 export async function PUT(request: NextRequest) {
-  const auth = requireRole(request, 'operator');
+  const auth = await requireRole(request, 'operator');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   const rateCheck = mutationLimiter(request);
   if (rateCheck) return rateCheck;
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const workspaceId = auth.user.workspace_id ?? 1;
     const body = await request.json();
 
@@ -340,67 +313,48 @@ export async function PUT(request: NextRequest) {
       // Single agent update
       const { name, status, last_activity, config, session_key, soul_content, role } = body;
       
-      const agent = db
-        .prepare('SELECT * FROM agents WHERE name = ? AND workspace_id = ?')
-        .get(name, workspaceId) as Agent;
+      const agent = await prisma.agents.findFirst({
+        where: { name, workspace_id: workspaceId },
+      }) as unknown as Agent | null
       if (!agent) {
         return NextResponse.json({ error: 'Agent not found' }, { status: 404 });
       }
       
       const now = Math.floor(Date.now() / 1000);
       
-      // Build dynamic update query
-      const fieldsToUpdate = [];
-      const params: any[] = [];
-      
+      const data: any = { updated_at: now }
       if (status !== undefined) {
-        fieldsToUpdate.push('status = ?');
-        params.push(status);
-        
-        fieldsToUpdate.push('last_seen = ?');
-        params.push(now);
+        data.status = status
+        data.last_seen = now
       }
       
       if (last_activity !== undefined) {
-        fieldsToUpdate.push('last_activity = ?');
-        params.push(last_activity);
+        data.last_activity = last_activity
       }
       
       if (config !== undefined) {
-        fieldsToUpdate.push('config = ?');
-        params.push(JSON.stringify(config));
+        data.config = JSON.stringify(config)
       }
       
       if (session_key !== undefined) {
-        fieldsToUpdate.push('session_key = ?');
-        params.push(session_key);
+        data.session_key = session_key
       }
       
       if (soul_content !== undefined) {
-        fieldsToUpdate.push('soul_content = ?');
-        params.push(soul_content);
+        data.soul_content = soul_content
       }
       
       if (role !== undefined) {
-        fieldsToUpdate.push('role = ?');
-        params.push(role);
+        data.role = role
       }
-      
-      fieldsToUpdate.push('updated_at = ?');
-      params.push(now);
-      params.push(name, workspaceId);
-      
-      if (fieldsToUpdate.length === 1) { // Only updated_at
+
+      if (Object.keys(data).length === 1) { // Only updated_at
         return NextResponse.json({ error: 'No fields to update' }, { status: 400 });
       }
-      
-      const stmt = db.prepare(`
-        UPDATE agents 
-        SET ${fieldsToUpdate.join(', ')}
-        WHERE name = ? AND workspace_id = ?
-      `);
-      
-      stmt.run(...params);
+      await prisma.agents.updateMany({
+        where: { name, workspace_id: workspaceId },
+        data,
+      })
       
       // Log status change if status was updated
       if (status !== undefined && status !== agent.status) {

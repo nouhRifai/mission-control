@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server"
 import { requireRole } from "@/lib/auth"
-import { getDatabase } from "@/lib/db"
+import { getPrismaClient } from "@/lib/prisma"
 
 interface GatewayHealthLogRow {
   gateway_id: number
@@ -25,17 +25,17 @@ interface GatewayHistory {
 }
 
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, "viewer")
+  const auth = await requireRole(request, "viewer")
   if ("error" in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
-  const db = getDatabase()
-  const rows = db.prepare(`
+  const prisma = getPrismaClient()
+  const rows = await prisma.$queryRaw<GatewayHealthLogRow[]>`
     SELECT l.gateway_id, g.name AS gateway_name, l.status, l.latency, l.probed_at, l.error
     FROM gateway_health_logs l
     LEFT JOIN gateways g ON g.id = l.gateway_id
     ORDER BY l.probed_at DESC
     LIMIT 100
-  `).all() as GatewayHealthLogRow[]
+  `
 
   const historyMap: Record<number, GatewayHistory> = {}
 

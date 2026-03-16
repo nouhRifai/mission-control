@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server"
 import { requireRole } from "@/lib/auth"
-import { getDatabase } from "@/lib/db"
+import { getPrismaClient } from "@/lib/prisma"
 
 interface GatewayEntry {
   id: number
@@ -140,11 +140,13 @@ function buildGatewayProbeUrl(host: string, port: number): string | null {
  * Probes gateways from the server where loopback addresses are reachable.
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, "viewer")
+  const auth = await requireRole(request, "viewer")
   if ("error" in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
-  const db = getDatabase()
-  const gateways = db.prepare("SELECT * FROM gateways ORDER BY is_primary DESC, name ASC").all() as GatewayEntry[]
+  const prisma = getPrismaClient()
+  const gateways = await prisma.gateways.findMany({
+    orderBy: [{ is_primary: 'desc' }, { name: 'asc' }],
+  }) as unknown as GatewayEntry[]
 
   // Build set of user-configured gateway hosts so the SSRF filter allows them
   const configuredHosts = new Set<string>()
@@ -155,32 +157,22 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  // Prepare update statements once (avoids N+1)
-  const updateOnlineStmt = db.prepare(
-    "UPDATE gateways SET status = ?, latency = ?, last_seen = (unixepoch()), updated_at = (unixepoch()) WHERE id = ?"
-  )
-  const updateOfflineStmt = db.prepare(
-    "UPDATE gateways SET status = ?, latency = NULL, updated_at = (unixepoch()) WHERE id = ?"
-  )
-  const insertLogStmt = db.prepare(
-    "INSERT INTO gateway_health_logs (gateway_id, status, latency, probed_at, error) VALUES (?, ?, ?, ?, ?)"
-  )
-
   const results: HealthResult[] = []
+  const logs: Array<{ gateway_id: number; status: string; latency: number | null; probed_at: number; error: string | null }> = []
 
   for (const gw of gateways) {
     const probedAt = Math.floor(Date.now() / 1000)
     const probeUrl = buildGatewayProbeUrl(gw.host, gw.port)
     if (!probeUrl) {
       const error = 'Invalid gateway address'
-      insertLogStmt.run(gw.id, 'error', null, probedAt, error)
+      logs.push({ gateway_id: gw.id, status: 'error', latency: null, probed_at: probedAt, error })
       results.push({ id: gw.id, name: gw.name, status: 'error', latency: null, agents: [], sessions_count: 0, error })
       continue
     }
 
     if (isBlockedUrl(probeUrl, configuredHosts)) {
       const error = 'Blocked URL'
-      insertLogStmt.run(gw.id, 'error', null, probedAt, error)
+      logs.push({ gateway_id: gw.id, status: 'error', latency: null, probed_at: probedAt, error })
       results.push({ id: gw.id, name: gw.name, status: 'error', latency: null, agents: [], sessions_count: 0, error })
       continue
     }
@@ -203,7 +195,7 @@ export async function POST(request: NextRequest) {
         : undefined
 
       const errorMessage = res.ok ? null : `HTTP ${res.status}`
-      insertLogStmt.run(gw.id, status, latency, probedAt, errorMessage)
+      logs.push({ gateway_id: gw.id, status, latency, probed_at: probedAt, error: errorMessage })
 
       results.push({
         id: gw.id,
@@ -218,7 +210,7 @@ export async function POST(request: NextRequest) {
       })
     } catch (err: any) {
       const errorMessage = err.name === "AbortError" ? "timeout" : (err.message || "connection failed")
-      insertLogStmt.run(gw.id, "offline", null, probedAt, errorMessage)
+      logs.push({ gateway_id: gw.id, status: 'offline', latency: null, probed_at: probedAt, error: errorMessage })
       results.push({
         id: gw.id,
         name: gw.name,
@@ -231,16 +223,34 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  // Persist all probe results in a single transaction
-  db.transaction(() => {
-    for (const r of results) {
+  // Persist probe results
+  const now = Math.floor(Date.now() / 1000)
+  const ops: any[] = []
+  if (logs.length > 0) {
+    ops.push(
+      prisma.gateway_health_logs.createMany({
+        data: logs.map((l) => ({ ...l }) as any),
+      })
+    )
+  }
+
+  for (const r of results) {
       if (r.status === 'online' || r.status === 'error') {
-        updateOnlineStmt.run(r.status, r.latency, r.id)
+        ops.push(prisma.gateways.updateMany({
+          where: { id: r.id },
+          data: { status: r.status, latency: r.latency, last_seen: now, updated_at: now } as any,
+        }))
       } else {
-        updateOfflineStmt.run(r.status, r.id)
+        ops.push(prisma.gateways.updateMany({
+          where: { id: r.id },
+          data: { status: r.status, latency: null, updated_at: now } as any,
+        }))
       }
-    }
-  })()
+  }
+
+  if (ops.length > 0) {
+    await prisma.$transaction(ops)
+  }
 
   return NextResponse.json({ results, probed_at: Date.now() })
 }

@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3'
+import { getPrismaClient } from '@/lib/prisma'
 
 export interface WorkspaceRecord {
   id: number
@@ -56,6 +57,35 @@ function logTenantAccessDenied(
   )
 }
 
+function logTenantAccessDeniedAsync(
+  targetType: 'workspace' | 'project',
+  targetId: number,
+  tenantId: number,
+  context: AccessAuditContext
+) {
+  const prisma = getPrismaClient()
+  const now = Math.floor(Date.now() / 1000)
+  void prisma.audit_log.create({
+    data: {
+      action: 'tenant_access_denied',
+      actor: context.actor || 'unknown',
+      actor_id: context.actorId ?? null,
+      target_type: targetType,
+      target_id: targetId,
+      detail: JSON.stringify({
+        tenant_id: tenantId,
+        route: context.route || null,
+      }),
+      ip_address: context.ipAddress ?? null,
+      user_agent: context.userAgent ?? null,
+      created_at: now,
+    },
+    select: { id: true },
+  }).catch(() => {
+    // best-effort
+  })
+}
+
 export function getWorkspaceForTenant(
   db: Database.Database,
   workspaceId: number,
@@ -80,6 +110,36 @@ export function listWorkspacesForTenant(
     WHERE tenant_id = ?
     ORDER BY CASE WHEN slug = 'default' THEN 0 ELSE 1 END, name COLLATE NOCASE ASC
   `).all(tenantId) as WorkspaceRecord[]
+}
+
+export async function getWorkspaceForTenantAsync(
+  workspaceId: number,
+  tenantId: number
+): Promise<WorkspaceRecord | null> {
+  const prisma = getPrismaClient()
+  const row = await prisma.workspaces.findFirst({
+    where: { id: workspaceId, tenant_id: tenantId },
+    select: { id: true, slug: true, name: true, tenant_id: true, created_at: true, updated_at: true },
+  })
+  return (row as any) || null
+}
+
+export async function listWorkspacesForTenantAsync(
+  tenantId: number
+): Promise<WorkspaceRecord[]> {
+  const prisma = getPrismaClient()
+  const rows = await prisma.workspaces.findMany({
+    where: { tenant_id: tenantId },
+    select: { id: true, slug: true, name: true, tenant_id: true, created_at: true, updated_at: true },
+  })
+
+  // Match legacy ordering: default first, then name case-insensitively.
+  return [...(rows as any[])].sort((a, b) => {
+    const aIsDefault = a.slug === 'default'
+    const bIsDefault = b.slug === 'default'
+    if (aIsDefault !== bIsDefault) return aIsDefault ? -1 : 1
+    return String(a.name).localeCompare(String(b.name), undefined, { sensitivity: 'base' })
+  }) as WorkspaceRecord[]
 }
 
 export function assertWorkspaceTenant(
@@ -108,6 +168,19 @@ export function ensureTenantWorkspaceAccess(
   return workspace
 }
 
+export async function ensureTenantWorkspaceAccessAsync(
+  tenantId: number,
+  workspaceId: number,
+  context: AccessAuditContext = {}
+): Promise<WorkspaceRecord> {
+  const workspace = await getWorkspaceForTenantAsync(workspaceId, tenantId)
+  if (!workspace) {
+    logTenantAccessDeniedAsync('workspace', workspaceId, tenantId, context)
+    throw new ForbiddenError('Workspace not accessible for tenant')
+  }
+  return workspace
+}
+
 export function ensureTenantProjectAccess(
   db: Database.Database,
   tenantId: number,
@@ -128,4 +201,34 @@ export function ensureTenantProjectAccess(
   }
 
   return project
+}
+
+export async function ensureTenantProjectAccessAsync(
+  tenantId: number,
+  projectId: number,
+  context: AccessAuditContext = {}
+): Promise<ProjectTenantRecord> {
+  const prisma = getPrismaClient()
+  const project = await prisma.projects.findFirst({
+    where: { id: projectId },
+    select: { id: true, workspace_id: true },
+  })
+
+  const tenantRow = project
+    ? await prisma.workspaces.findUnique({
+        where: { id: project.workspace_id },
+        select: { tenant_id: true },
+      })
+    : null
+
+  const resolved: ProjectTenantRecord | null = project && tenantRow
+    ? { id: project.id, workspace_id: project.workspace_id, tenant_id: tenantRow.tenant_id }
+    : null
+
+  if (!resolved || resolved.tenant_id !== tenantId) {
+    logTenantAccessDeniedAsync('project', projectId, tenantId, context)
+    throw new ForbiddenError('Project not accessible for tenant')
+  }
+
+  return resolved
 }

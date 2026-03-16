@@ -15,8 +15,8 @@
 import { readdirSync, readFileSync, statSync } from 'fs'
 import { join } from 'path'
 import { config } from './config'
-import { getDatabase } from './db'
 import { logger } from './logger'
+import { getPrismaClient } from './prisma'
 
 // Rough per-token pricing (USD) for cost estimation
 const MODEL_PRICING: Record<string, { input: number; output: number }> = {
@@ -271,49 +271,60 @@ export async function syncClaudeSessions(force = false): Promise<{ ok: boolean; 
       return { ok: true, message: 'No Claude sessions found' }
     }
 
-    const db = getDatabase()
-    const now = Math.floor(Date.now() / 1000)
-
-    const upsert = db.prepare(`
-      INSERT INTO claude_sessions (
-        session_id, project_slug, project_path, model, git_branch,
-        user_messages, assistant_messages, tool_uses,
-        input_tokens, output_tokens, estimated_cost,
-        first_message_at, last_message_at, last_user_prompt,
-        is_active, scanned_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(session_id) DO UPDATE SET
-        model = excluded.model,
-        git_branch = excluded.git_branch,
-        user_messages = excluded.user_messages,
-        assistant_messages = excluded.assistant_messages,
-        tool_uses = excluded.tool_uses,
-        input_tokens = excluded.input_tokens,
-        output_tokens = excluded.output_tokens,
-        estimated_cost = excluded.estimated_cost,
-        last_message_at = excluded.last_message_at,
-        last_user_prompt = excluded.last_user_prompt,
-        is_active = excluded.is_active,
-        scanned_at = excluded.scanned_at,
-        updated_at = excluded.updated_at
-    `)
+    const prisma = getPrismaClient()
+    const nowSec = Math.floor(Date.now() / 1000)
 
     let upserted = 0
-    db.transaction(() => {
-      // Mark all sessions inactive before scanning
-      db.prepare('UPDATE claude_sessions SET is_active = 0').run()
+    await prisma.$transaction(async (tx) => {
+      // Mark all sessions inactive before scanning.
+      await tx.claude_sessions.updateMany({ data: { is_active: 0, updated_at: nowSec } })
 
       for (const s of sessions) {
-        upsert.run(
-          s.sessionId, s.projectSlug, s.projectPath, s.model, s.gitBranch,
-          s.userMessages, s.assistantMessages, s.toolUses,
-          s.inputTokens, s.outputTokens, s.estimatedCost,
-          s.firstMessageAt, s.lastMessageAt, s.lastUserPrompt,
-          s.isActive ? 1 : 0, now, now,
-        )
+        await tx.claude_sessions.upsert({
+          where: { session_id: s.sessionId },
+          create: {
+            session_id: s.sessionId,
+            project_slug: s.projectSlug,
+            project_path: s.projectPath,
+            model: s.model,
+            git_branch: s.gitBranch,
+            user_messages: s.userMessages,
+            assistant_messages: s.assistantMessages,
+            tool_uses: s.toolUses,
+            input_tokens: s.inputTokens,
+            output_tokens: s.outputTokens,
+            estimated_cost: s.estimatedCost,
+            first_message_at: s.firstMessageAt,
+            last_message_at: s.lastMessageAt,
+            last_user_prompt: s.lastUserPrompt,
+            is_active: s.isActive ? 1 : 0,
+            scanned_at: nowSec,
+            created_at: nowSec,
+            updated_at: nowSec,
+          },
+          update: {
+            project_slug: s.projectSlug,
+            project_path: s.projectPath,
+            model: s.model,
+            git_branch: s.gitBranch,
+            user_messages: s.userMessages,
+            assistant_messages: s.assistantMessages,
+            tool_uses: s.toolUses,
+            input_tokens: s.inputTokens,
+            output_tokens: s.outputTokens,
+            estimated_cost: s.estimatedCost,
+            first_message_at: s.firstMessageAt,
+            last_message_at: s.lastMessageAt,
+            last_user_prompt: s.lastUserPrompt,
+            is_active: s.isActive ? 1 : 0,
+            scanned_at: nowSec,
+            updated_at: nowSec,
+          },
+          select: { id: true },
+        })
         upserted++
       }
-    })()
+    })
 
     const active = sessions.filter(s => s.isActive).length
     lastSyncAt = Date.now()

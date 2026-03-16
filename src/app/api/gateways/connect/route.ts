@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
-import { getDatabase } from '@/lib/db'
 import { buildGatewayWebSocketUrl } from '@/lib/gateway-url'
 import { getDetectedGatewayToken } from '@/lib/gateway-runtime'
+import { getPrismaClient } from '@/lib/prisma'
 import {
   isTailscaleServe,
   refreshTailscaleCache,
@@ -88,26 +88,6 @@ function resolveRemoteGatewayUrl(
   return `${protocol}://${browserHost}:${gateway.port}`
 }
 
-function ensureTable(db: ReturnType<typeof getDatabase>) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS gateways (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL UNIQUE,
-      host TEXT NOT NULL DEFAULT '127.0.0.1',
-      port INTEGER NOT NULL DEFAULT 18789,
-      token TEXT NOT NULL DEFAULT '',
-      is_primary INTEGER NOT NULL DEFAULT 0,
-      status TEXT NOT NULL DEFAULT 'unknown',
-      last_seen INTEGER,
-      latency INTEGER,
-      sessions_count INTEGER NOT NULL DEFAULT 0,
-      agents_count INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-      updated_at INTEGER NOT NULL DEFAULT (unixepoch())
-    )
-  `)
-}
-
 /**
  * POST /api/gateways/connect
  * Resolves websocket URL and token for a selected gateway without exposing tokens in list payloads.
@@ -116,11 +96,10 @@ export async function POST(request: NextRequest) {
   // Any authenticated dashboard user may initiate a gateway websocket connect.
   // Restricting this to operator can cause startup fallback to connect without auth,
   // which then fails as "device identity required".
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
-  const db = getDatabase()
-  ensureTable(db)
+  const prisma = getPrismaClient()
 
   let id: number | null = null
   try {
@@ -134,7 +113,10 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'id is required' }, { status: 400 })
   }
 
-  const gateway = db.prepare('SELECT id, host, port, token, is_primary FROM gateways WHERE id = ?').get(id) as GatewayEntry | undefined
+  const gateway = await prisma.gateways.findFirst({
+    where: { id },
+    select: { id: true, host: true, port: true, token: true, is_primary: true },
+  }) as unknown as GatewayEntry | null
   if (!gateway) {
     return NextResponse.json({ error: 'Gateway not found' }, { status: 404 })
   }
@@ -160,7 +142,10 @@ export async function POST(request: NextRequest) {
   // Keep runtime DB aligned with detected OpenClaw gateway token for primary gateway.
   if (gateway.is_primary === 1 && detectedToken && detectedToken !== dbToken) {
     try {
-      db.prepare('UPDATE gateways SET token = ?, updated_at = (unixepoch()) WHERE id = ?').run(detectedToken, gateway.id)
+      await prisma.gateways.updateMany({
+        where: { id: gateway.id },
+        data: { token: detectedToken, updated_at: Math.floor(Date.now() / 1000) } as any,
+      })
     } catch {
       // Non-fatal: connect still succeeds with detected token even if persistence fails.
     }

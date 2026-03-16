@@ -5,7 +5,7 @@ import { config, ensureDirExists } from '@/lib/config'
 import { requireRole } from '@/lib/auth'
 import { getAllGatewaySessions } from '@/lib/sessions'
 import { logger } from '@/lib/logger'
-import { getDatabase } from '@/lib/db'
+import { getPrismaClient } from '@/lib/prisma'
 import { calculateTokenCost } from '@/lib/token-pricing'
 import { getProviderSubscriptionFlags } from '@/lib/provider-subscriptions'
 import { buildTaskCostReport, type TaskCostMetadata } from '@/lib/task-costs'
@@ -63,16 +63,24 @@ interface DbTokenUsageRow {
   created_at: number
 }
 
-function loadTokenDataFromDb(workspaceId: number, providerSubscriptions: Record<string, boolean>): TokenUsageRecord[] {
+async function loadTokenDataFromDb(workspaceId: number, providerSubscriptions: Record<string, boolean>): Promise<TokenUsageRecord[]> {
   try {
-    const db = getDatabase()
-    const rows = db.prepare(`
-      SELECT id, model, session_id, input_tokens, output_tokens, task_id, workspace_id, created_at
-      FROM token_usage
-      WHERE workspace_id = ?
-      ORDER BY created_at DESC, id DESC
-      LIMIT 10000
-    `).all(workspaceId) as DbTokenUsageRow[]
+    const prisma = getPrismaClient()
+    const rows = (await prisma.token_usage.findMany({
+      where: { workspace_id: workspaceId },
+      orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
+      take: 10000,
+      select: {
+        id: true,
+        model: true,
+        session_id: true,
+        input_tokens: true,
+        output_tokens: true,
+        task_id: true,
+        workspace_id: true,
+        created_at: true,
+      },
+    })) as unknown as DbTokenUsageRow[]
 
     return rows.map((row) => {
       const totalTokens = row.input_tokens + row.output_tokens
@@ -175,7 +183,7 @@ async function loadTokenDataFromFile(workspaceId: number, providerSubscriptions:
  */
 async function loadTokenData(workspaceId: number): Promise<TokenUsageRecord[]> {
   const providerSubscriptions = getProviderSubscriptionFlags()
-  const dbRecords = loadTokenDataFromDb(workspaceId, providerSubscriptions)
+  const dbRecords = await loadTokenDataFromDb(workspaceId, providerSubscriptions)
   const fileRecords = await loadTokenDataFromFile(workspaceId, providerSubscriptions)
   const sessionRecords = deriveFromSessions(workspaceId, providerSubscriptions)
   return dedupeTokenRecords([...dbRecords, ...fileRecords, ...sessionRecords])
@@ -271,28 +279,40 @@ function filterByTimeframe(records: TokenUsageRecord[], timeframe: string): Toke
   return records.filter(record => record.timestamp >= cutoffTime)
 }
 
-function loadTaskMetadataById(workspaceId: number, taskIds: number[]): Record<number, TaskCostMetadata> {
+async function loadTaskMetadataById(workspaceId: number, taskIds: number[]): Promise<Record<number, TaskCostMetadata>> {
   if (taskIds.length === 0) return {}
-  const db = getDatabase()
-  const placeholders = taskIds.map(() => '?').join(', ')
-  const rows = db.prepare(`
-    SELECT
-      t.id,
-      t.title,
-      t.status,
-      t.priority,
-      t.assigned_to,
-      t.project_id,
-      p.name as project_name,
-      p.slug as project_slug,
-      p.ticket_prefix as project_prefix,
-      t.project_ticket_no
-    FROM tasks t
-    LEFT JOIN projects p
-      ON p.id = t.project_id AND p.workspace_id = t.workspace_id
-    WHERE t.workspace_id = ?
-      AND t.id IN (${placeholders})
-  `).all(workspaceId, ...taskIds) as TaskMetadataRow[]
+  const prisma = getPrismaClient()
+  const tasks = (await prisma.tasks.findMany({
+    where: { workspace_id: workspaceId, id: { in: taskIds } },
+    select: {
+      id: true,
+      title: true,
+      status: true,
+      priority: true,
+      assigned_to: true,
+      project_id: true,
+      project_ticket_no: true,
+    },
+  })) as any[]
+
+  const projectIds = [...new Set(tasks.map((t) => t.project_id).filter((id) => typeof id === 'number'))] as number[]
+  const projects = projectIds.length
+    ? (await prisma.projects.findMany({
+        where: { workspace_id: workspaceId, id: { in: projectIds } },
+        select: { id: true, name: true, slug: true, ticket_prefix: true },
+      })) as any[]
+    : []
+  const projectById = new Map<number, any>(projects.map((p) => [p.id as number, p]))
+
+  const rows: TaskMetadataRow[] = tasks.map((task) => {
+    const project = typeof task.project_id === 'number' ? projectById.get(task.project_id) : null
+    return {
+      ...task,
+      project_name: project?.name ?? null,
+      project_slug: project?.slug ?? null,
+      project_prefix: project?.ticket_prefix ?? null,
+    }
+  })
 
   const out: Record<number, TaskCostMetadata> = {}
   for (const row of rows) {
@@ -302,7 +322,7 @@ function loadTaskMetadataById(workspaceId: number, taskIds: number[]): Record<nu
 }
 
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
@@ -433,7 +453,7 @@ export async function GET(request: NextRequest) {
           .filter((taskId): taskId is number => Number.isFinite(taskId) && Number(taskId) > 0)
           .map((taskId) => Number(taskId))
       )]
-      const taskMetadataById = loadTaskMetadataById(workspaceId, attributedTaskIds)
+      const taskMetadataById = await loadTaskMetadataById(workspaceId, attributedTaskIds)
       const report = buildTaskCostReport(
         filteredData.map((record) => ({
           model: record.model,
@@ -553,7 +573,7 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
@@ -575,11 +595,12 @@ export async function POST(request: NextRequest) {
 
     let validatedTaskId: number | null = null
     if (parsedTaskId) {
-      const db = getDatabase()
-      const taskRow = db.prepare(
-        'SELECT id FROM tasks WHERE id = ? AND workspace_id = ?'
-      ).get(parsedTaskId, workspaceId) as { id?: number } | undefined
-      if (taskRow?.id) validatedTaskId = taskRow.id
+      const prisma = getPrismaClient()
+      const taskRow = await prisma.tasks.findFirst({
+        where: { id: parsedTaskId, workspace_id: workspaceId },
+        select: { id: true },
+      })
+      if (taskRow?.id) validatedTaskId = taskRow.id as any
     }
 
     const record: TokenUsageRecord = {

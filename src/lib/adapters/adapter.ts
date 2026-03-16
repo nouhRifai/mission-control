@@ -1,19 +1,28 @@
-import { getDatabase } from '@/lib/db'
+import { getPrismaClient } from '@/lib/prisma'
 
-export function queryPendingAssignments(agentId: string): Assignment[] {
+export async function queryPendingAssignments(agentId: string): Promise<Assignment[]> {
   try {
-    const db = getDatabase()
-    const rows = db.prepare(`
+    const prisma = getPrismaClient()
+    const workspaceId = 1
+    const rows = await prisma.$queryRaw<Array<{ id: number; title: string; description: string | null; priority: string }>>`
       SELECT id, title, description, priority
       FROM tasks
-      WHERE (assigned_to = ? OR assigned_to IS NULL)
+      WHERE workspace_id = ${workspaceId}
+        AND (assigned_to = ${agentId} OR assigned_to IS NULL)
         AND status IN ('assigned', 'inbox')
       ORDER BY
-        CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END ASC,
+        CASE priority
+          WHEN 'critical' THEN 0
+          WHEN 'urgent' THEN 0
+          WHEN 'high' THEN 1
+          WHEN 'medium' THEN 2
+          WHEN 'low' THEN 3
+          ELSE 4
+        END ASC,
         due_date ASC,
         created_at ASC
       LIMIT 5
-    `).all(agentId) as Array<{ id: number; title: string; description: string | null; priority: string }>
+    `
 
     return rows.map(row => ({
       taskId: String(row.id),

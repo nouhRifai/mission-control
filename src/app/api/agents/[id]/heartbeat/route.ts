@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDatabase, db_helpers } from '@/lib/db';
+import { db_helpers } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
 import { agentHeartbeatLimiter } from '@/lib/rate-limit';
 import { logger } from '@/lib/logger';
 import { resolveTaskImplementationTarget } from '@/lib/task-routing';
+import { getPrismaClient } from '@/lib/prisma';
 
 /**
  * GET /api/agents/[id]/heartbeat - Agent heartbeat check
@@ -19,11 +20,11 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const resolvedParams = await params;
     const agentId = resolvedParams.id;
     const workspaceId = auth.user.workspace_id ?? 1;
@@ -32,10 +33,10 @@ export async function GET(
     let agent: any;
     if (isNaN(Number(agentId))) {
       // Lookup by name
-      agent = db.prepare('SELECT * FROM agents WHERE name = ? AND workspace_id = ?').get(agentId, workspaceId);
+      agent = await prisma.agents.findFirst({ where: { name: agentId, workspace_id: workspaceId } });
     } else {
       // Lookup by ID
-      agent = db.prepare('SELECT * FROM agents WHERE id = ? AND workspace_id = ?').get(Number(agentId), workspaceId);
+      agent = await prisma.agents.findFirst({ where: { id: Number(agentId), workspace_id: workspaceId } });
     }
     
     if (!agent) {
@@ -47,17 +48,17 @@ export async function GET(
     const fourHoursAgo = now - (4 * 60 * 60); // Check last 4 hours
     
     // 1. Check for @mentions in recent comments
-    const mentions = db.prepare(`
-      SELECT c.*, t.title as task_title 
-      FROM comments c
-      JOIN tasks t ON c.task_id = t.id
-      WHERE c.mentions LIKE ?
-      AND c.workspace_id = ?
-      AND t.workspace_id = ?
-      AND c.created_at > ?
-      ORDER BY c.created_at DESC
-      LIMIT 10
-    `).all(`%"${agent.name}"%`, workspaceId, workspaceId, fourHoursAgo);
+    const mentions = await prisma.comments.findMany({
+      where: {
+        workspace_id: workspaceId,
+        created_at: { gt: fourHoursAgo },
+        mentions: { contains: `"${agent.name}"` },
+        tasks: { workspace_id: workspaceId },
+      },
+      include: { tasks: { select: { title: true } } },
+      orderBy: { created_at: 'desc' },
+      take: 10,
+    });
     
     if (mentions.length > 0) {
       workItems.push({
@@ -65,23 +66,24 @@ export async function GET(
         count: mentions.length,
         items: mentions.map((m: any) => ({
           id: m.id,
-          task_title: m.task_title,
+          task_title: m.tasks?.title,
           author: m.author,
-          content: m.content.substring(0, 100) + '...',
+          content: m.content.length > 100 ? m.content.substring(0, 100) + '...' : m.content,
           created_at: m.created_at
         }))
       });
     }
     
     // 2. Check for assigned tasks
-    const assignedTasks = db.prepare(`
-      SELECT * FROM tasks 
-      WHERE assigned_to = ?
-      AND workspace_id = ?
-      AND status IN ('assigned', 'in_progress')
-      ORDER BY priority DESC, created_at ASC
-      LIMIT 10
-    `).all(agent.name, workspaceId) as any[];
+    const assignedTasks = await prisma.tasks.findMany({
+      where: {
+        assigned_to: agent.name,
+        workspace_id: workspaceId,
+        status: { in: ['assigned', 'in_progress'] },
+      },
+      orderBy: [{ priority: 'desc' }, { created_at: 'asc' }],
+      take: 10,
+    });
 
     if (assignedTasks.length > 0) {
       workItems.push({
@@ -99,7 +101,10 @@ export async function GET(
     }
     
     // 3. Check for unread notifications
-    const notifications = db_helpers.getUnreadNotifications(agent.name, workspaceId);
+    const notifications = await prisma.notifications.findMany({
+      where: { recipient: agent.name, read_at: null, workspace_id: workspaceId },
+      orderBy: { created_at: 'desc' },
+    });
     
     if (notifications.length > 0) {
       workItems.push({
@@ -116,15 +121,16 @@ export async function GET(
     }
     
     // 4. Check for urgent activities that might need attention
-    const urgentActivities = db.prepare(`
-      SELECT * FROM activities 
-      WHERE type IN ('task_created', 'task_assigned', 'high_priority_alert')
-      AND workspace_id = ?
-      AND created_at > ?
-      AND description LIKE ?
-      ORDER BY created_at DESC
-      LIMIT 5
-    `).all(workspaceId, fourHoursAgo, `%${agent.name}%`);
+    const urgentActivities = await prisma.activities.findMany({
+      where: {
+        type: { in: ['task_created', 'task_assigned', 'high_priority_alert'] },
+        workspace_id: workspaceId,
+        created_at: { gt: fourHoursAgo },
+        description: { contains: agent.name },
+      },
+      orderBy: { created_at: 'desc' },
+      take: 5,
+    });
     
     if (urgentActivities.length > 0) {
       workItems.push({
@@ -189,7 +195,7 @@ export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'operator');
+  const auth = await requireRole(request, 'operator');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   const rateLimited = agentHeartbeatLimiter(request);
@@ -203,14 +209,16 @@ export async function POST(
   }
 
   const { connection_id, token_usage } = body;
-  const db = getDatabase();
+  const prisma = getPrismaClient();
   const now = Math.floor(Date.now() / 1000);
   const workspaceId = auth.user.workspace_id ?? 1;
 
   // Update direct connection heartbeat if connection_id provided
   if (connection_id) {
-    db.prepare('UPDATE direct_connections SET last_heartbeat = ?, updated_at = ? WHERE connection_id = ? AND status = ? AND workspace_id = ?')
-      .run(now, now, connection_id, 'connected', workspaceId);
+    await prisma.direct_connections.updateMany({
+      where: { connection_id, status: 'connected', workspace_id: workspaceId },
+      data: { last_heartbeat: now, updated_at: now },
+    })
   }
 
   // Inline token reporting
@@ -220,9 +228,9 @@ export async function POST(
     const agentId = resolvedParams.id;
     let agent: any;
     if (isNaN(Number(agentId))) {
-      agent = db.prepare('SELECT * FROM agents WHERE name = ? AND workspace_id = ?').get(agentId, workspaceId);
+      agent = await prisma.agents.findFirst({ where: { name: agentId, workspace_id: workspaceId } });
     } else {
-      agent = db.prepare('SELECT * FROM agents WHERE id = ? AND workspace_id = ?').get(Number(agentId), workspaceId);
+      agent = await prisma.agents.findFirst({ where: { id: Number(agentId), workspace_id: workspaceId } });
     }
 
     if (agent) {
@@ -234,9 +242,10 @@ export async function POST(
 
       let taskId: number | null = null
       if (parsedTaskId && parsedTaskId > 0) {
-        const taskRow = db.prepare(
-          'SELECT id FROM tasks WHERE id = ? AND workspace_id = ?'
-        ).get(parsedTaskId, workspaceId) as { id?: number } | undefined
+        const taskRow = await prisma.tasks.findFirst({
+          where: { id: parsedTaskId, workspace_id: workspaceId },
+          select: { id: true },
+        })
         if (taskRow?.id) {
           taskId = taskRow.id
         } else {
@@ -244,18 +253,19 @@ export async function POST(
         }
       }
 
-      db.prepare(
-        `INSERT INTO token_usage (model, session_id, input_tokens, output_tokens, created_at, workspace_id, task_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        token_usage.model,
-        sessionId,
-        token_usage.inputTokens,
-        token_usage.outputTokens,
-        now,
-        workspaceId,
-        taskId
-      );
+      await prisma.token_usage.create({
+        data: {
+          model: token_usage.model,
+          session_id: sessionId,
+          input_tokens: token_usage.inputTokens,
+          output_tokens: token_usage.outputTokens,
+          created_at: now,
+          workspace_id: workspaceId,
+          task_id: taskId,
+          agent_name: agent.name,
+        },
+        select: { id: true },
+      })
       tokenRecorded = true;
     }
   }

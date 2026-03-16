@@ -1,13 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDatabase, Task, db_helpers } from '@/lib/db';
+import { Task, db_helpers } from '@/lib/db';
 import { eventBus } from '@/lib/event-bus';
 import { requireRole } from '@/lib/auth';
 import { mutationLimiter } from '@/lib/rate-limit';
 import { logger } from '@/lib/logger';
 import { validateBody, updateTaskSchema } from '@/lib/validation';
-import { resolveMentionRecipients } from '@/lib/mentions';
+import { resolveMentionRecipientsAsync } from '@/lib/mentions';
 import { normalizeTaskUpdateStatus } from '@/lib/task-status';
 import { pushTaskToGitHub } from '@/lib/github-sync-engine';
+import { getPrismaClient } from '@/lib/prisma';
 
 function formatTicketRef(prefix?: string | null, num?: number | null): string | undefined {
   if (!prefix || typeof num !== 'number' || !Number.isFinite(num) || num <= 0) return undefined
@@ -23,17 +24,16 @@ function mapTaskRow(task: any): Task & { tags: string[]; metadata: Record<string
   }
 }
 
-function hasAegisApproval(
-  db: ReturnType<typeof getDatabase>,
+async function hasAegisApproval(
+  prisma: ReturnType<typeof getPrismaClient>,
   taskId: number,
   workspaceId: number
-): boolean {
-  const review = db.prepare(`
-    SELECT status FROM quality_reviews
-    WHERE task_id = ? AND reviewer = 'aegis' AND workspace_id = ?
-    ORDER BY created_at DESC
-    LIMIT 1
-  `).get(taskId, workspaceId) as { status?: string } | undefined
+): Promise<boolean> {
+  const review = await prisma.quality_reviews.findFirst({
+    where: { task_id: taskId, reviewer: 'aegis', workspace_id: workspaceId },
+    select: { status: true },
+    orderBy: { created_at: 'desc' },
+  })
   return review?.status === 'approved'
 }
 
@@ -44,11 +44,11 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'viewer');
+  const auth = await requireRole(request, 'viewer');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const resolvedParams = await params;
     const taskId = parseInt(resolvedParams.id);
     const workspaceId = auth.user.workspace_id ?? 1;
@@ -57,20 +57,27 @@ export async function GET(
       return NextResponse.json({ error: 'Invalid task ID' }, { status: 400 });
     }
     
-    const stmt = db.prepare(`
-      SELECT t.*, p.name as project_name, p.ticket_prefix as project_prefix
-      FROM tasks t
-      LEFT JOIN projects p ON p.id = t.project_id AND p.workspace_id = t.workspace_id
-      WHERE t.id = ? AND t.workspace_id = ?
-    `);
-    const task = stmt.get(taskId, workspaceId) as Task;
+    const task = await prisma.tasks.findFirst({
+      where: { id: taskId, workspace_id: workspaceId },
+    })
     
     if (!task) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 });
     }
+
+    const project = task.project_id
+      ? await prisma.projects.findFirst({
+          where: { id: task.project_id, workspace_id: workspaceId },
+          select: { name: true, ticket_prefix: true },
+        })
+      : null
     
     // Parse JSON fields
-    const taskWithParsedData = mapTaskRow(task);
+    const taskWithParsedData = mapTaskRow({
+      ...(task as any),
+      project_name: project?.name ?? null,
+      project_prefix: project?.ticket_prefix ?? null,
+    });
     
     return NextResponse.json({ task: taskWithParsedData });
   } catch (error) {
@@ -86,14 +93,14 @@ export async function PUT(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'operator');
+  const auth = await requireRole(request, 'operator');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   const rateCheck = mutationLimiter(request);
   if (rateCheck) return rateCheck;
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const resolvedParams = await params;
     const taskId = parseInt(resolvedParams.id);
     const workspaceId = auth.user.workspace_id ?? 1;
@@ -106,9 +113,9 @@ export async function PUT(
     }
     
     // Get current task for comparison
-    const currentTask = db
-      .prepare('SELECT * FROM tasks WHERE id = ? AND workspace_id = ?')
-      .get(taskId, workspaceId) as Task;
+    const currentTask = await prisma.tasks.findFirst({
+      where: { id: taskId, workspace_id: workspaceId },
+    }) as unknown as Task | null;
     
     if (!currentTask) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 });
@@ -143,7 +150,7 @@ export async function PUT(
     
     const now = Math.floor(Date.now() / 1000);
     const descriptionMentionResolution = description !== undefined
-      ? resolveMentionRecipients(description || '', db, workspaceId)
+      ? await resolveMentionRecipientsAsync(description || '', workspaceId)
       : null;
     if (descriptionMentionResolution && descriptionMentionResolution.unresolved.length > 0) {
       return NextResponse.json({
@@ -152,136 +159,78 @@ export async function PUT(
       }, { status: 400 });
     }
 
-    const previousDescriptionMentionRecipients = resolveMentionRecipients(currentTask.description || '', db, workspaceId).recipients;
-    
-    // Build dynamic update query
-    const fieldsToUpdate = [];
-    const updateParams: any[] = [];
-    let nextProjectTicketNo: number | null = null;
-    
-    if (title !== undefined) {
-      fieldsToUpdate.push('title = ?');
-      updateParams.push(title);
-    }
-    if (description !== undefined) {
-      fieldsToUpdate.push('description = ?');
-      updateParams.push(description);
-    }
-    if (normalizedStatus !== undefined) {
-      if (normalizedStatus === 'done' && !hasAegisApproval(db, taskId, workspaceId)) {
+    const previousDescriptionMentionRecipients = (await resolveMentionRecipientsAsync(
+      currentTask.description || '',
+      workspaceId
+    )).recipients;
+
+    if (normalizedStatus === 'done') {
+      const approved = await hasAegisApproval(prisma, taskId, workspaceId)
+      if (!approved) {
         return NextResponse.json(
           { error: 'Aegis approval is required to move task to done.' },
           { status: 403 }
         )
       }
-      fieldsToUpdate.push('status = ?');
-      updateParams.push(normalizedStatus);
     }
-    if (priority !== undefined) {
-      fieldsToUpdate.push('priority = ?');
-      updateParams.push(priority);
-    }
+
+    // Pre-validate project change to preserve old 400 behavior.
     if (project_id !== undefined) {
-      const project = db.prepare(`
-        SELECT id FROM projects
-        WHERE id = ? AND workspace_id = ? AND status = 'active'
-      `).get(project_id, workspaceId) as { id: number } | undefined
-      if (!project) {
-        return NextResponse.json({ error: 'Project not found or archived' }, { status: 400 })
-      }
-      if (project_id !== currentTask.project_id) {
-        db.prepare(`
-          UPDATE projects
-          SET ticket_counter = ticket_counter + 1, updated_at = unixepoch()
-          WHERE id = ? AND workspace_id = ?
-        `).run(project_id, workspaceId)
-        const row = db.prepare(`
-          SELECT ticket_counter FROM projects
-          WHERE id = ? AND workspace_id = ?
-        `).get(project_id, workspaceId) as { ticket_counter: number } | undefined
-        if (!row || !row.ticket_counter) {
-          return NextResponse.json({ error: 'Failed to allocate project ticket number' }, { status: 500 })
-        }
-        nextProjectTicketNo = row.ticket_counter
-      }
-      fieldsToUpdate.push('project_id = ?');
-      updateParams.push(project_id);
-      if (nextProjectTicketNo !== null) {
-        fieldsToUpdate.push('project_ticket_no = ?');
-        updateParams.push(nextProjectTicketNo);
-      }
+      const project = await prisma.projects.findFirst({
+        where: { id: project_id, workspace_id: workspaceId, status: 'active' },
+        select: { id: true },
+      })
+      if (!project) return NextResponse.json({ error: 'Project not found or archived' }, { status: 400 })
     }
-    if (assigned_to !== undefined) {
-      fieldsToUpdate.push('assigned_to = ?');
-      updateParams.push(assigned_to);
-    }
-    if (due_date !== undefined) {
-      fieldsToUpdate.push('due_date = ?');
-      updateParams.push(due_date);
-    }
-    if (estimated_hours !== undefined) {
-      fieldsToUpdate.push('estimated_hours = ?');
-      updateParams.push(estimated_hours);
-    }
-    if (actual_hours !== undefined) {
-      fieldsToUpdate.push('actual_hours = ?');
-      updateParams.push(actual_hours);
-    }
-    if (outcome !== undefined) {
-      fieldsToUpdate.push('outcome = ?');
-      updateParams.push(outcome);
-    }
-    if (error_message !== undefined) {
-      fieldsToUpdate.push('error_message = ?');
-      updateParams.push(error_message);
-    }
-    if (resolution !== undefined) {
-      fieldsToUpdate.push('resolution = ?');
-      updateParams.push(resolution);
-    }
-    if (feedback_rating !== undefined) {
-      fieldsToUpdate.push('feedback_rating = ?');
-      updateParams.push(feedback_rating);
-    }
-    if (feedback_notes !== undefined) {
-      fieldsToUpdate.push('feedback_notes = ?');
-      updateParams.push(feedback_notes);
-    }
-    if (retry_count !== undefined) {
-      fieldsToUpdate.push('retry_count = ?');
-      updateParams.push(retry_count);
-    }
+
+    const data: any = { updated_at: now }
+    if (title !== undefined) data.title = title
+    if (description !== undefined) data.description = description
+    if (normalizedStatus !== undefined) data.status = normalizedStatus
+    if (priority !== undefined) data.priority = priority
+    if (assigned_to !== undefined) data.assigned_to = assigned_to
+    if (due_date !== undefined) data.due_date = due_date
+    if (estimated_hours !== undefined) data.estimated_hours = estimated_hours
+    if (actual_hours !== undefined) data.actual_hours = actual_hours
+    if (outcome !== undefined) data.outcome = outcome
+    if (error_message !== undefined) data.error_message = error_message
+    if (resolution !== undefined) data.resolution = resolution
+    if (feedback_rating !== undefined) data.feedback_rating = feedback_rating
+    if (feedback_notes !== undefined) data.feedback_notes = feedback_notes
+    if (retry_count !== undefined) data.retry_count = retry_count
     if (completed_at !== undefined) {
-      fieldsToUpdate.push('completed_at = ?');
-      updateParams.push(completed_at);
+      data.completed_at = completed_at
     } else if (normalizedStatus === 'done' && !currentTask.completed_at) {
-      fieldsToUpdate.push('completed_at = ?');
-      updateParams.push(now);
+      data.completed_at = now
     }
-    if (tags !== undefined) {
-      fieldsToUpdate.push('tags = ?');
-      updateParams.push(JSON.stringify(tags));
+    if (tags !== undefined) data.tags = JSON.stringify(tags)
+    if (metadata !== undefined) data.metadata = JSON.stringify(metadata)
+
+    let nextProjectTicketNo: number | null = null
+    if (project_id !== undefined) {
+      data.project_id = project_id
     }
-    if (metadata !== undefined) {
-      fieldsToUpdate.push('metadata = ?');
-      updateParams.push(JSON.stringify(metadata));
-    }
-    
-    fieldsToUpdate.push('updated_at = ?');
-    updateParams.push(now);
-    updateParams.push(taskId, workspaceId);
-    
-    if (fieldsToUpdate.length === 1) { // Only updated_at
+
+    if (Object.keys(data).length === 1) { // Only updated_at
       return NextResponse.json({ error: 'No fields to update' }, { status: 400 });
     }
-    
-    const stmt = db.prepare(`
-      UPDATE tasks 
-      SET ${fieldsToUpdate.join(', ')}
-      WHERE id = ? AND workspace_id = ?
-    `);
-    
-    stmt.run(...updateParams);
+
+    await prisma.$transaction(async (tx) => {
+      if (project_id !== undefined && project_id !== currentTask.project_id) {
+        const updatedProject = await tx.projects.update({
+          where: { id: project_id },
+          data: { ticket_counter: { increment: 1 }, updated_at: now },
+          select: { ticket_counter: true },
+        })
+        nextProjectTicketNo = updatedProject.ticket_counter
+        data.project_ticket_no = nextProjectTicketNo
+      }
+
+      await tx.tasks.updateMany({
+        where: { id: taskId, workspace_id: workspaceId },
+        data,
+      })
+    })
     
     // Track changes and log activities
     const changes: string[] = [];
@@ -378,28 +327,32 @@ export async function PUT(
     }
     
     // Fetch updated task
-    const updatedTask = db.prepare(`
-      SELECT t.*, p.name as project_name, p.ticket_prefix as project_prefix
-      FROM tasks t
-      LEFT JOIN projects p ON p.id = t.project_id AND p.workspace_id = t.workspace_id
-      WHERE t.id = ? AND t.workspace_id = ?
-    `).get(taskId, workspaceId) as Task;
-    const parsedTask = mapTaskRow(updatedTask);
+    const updatedTask = await prisma.tasks.findFirst({
+      where: { id: taskId, workspace_id: workspaceId },
+    })
+    if (!updatedTask) throw new Error('Task not found after update')
+
+    const updatedProject = updatedTask.project_id
+      ? await prisma.projects.findFirst({
+          where: { id: updatedTask.project_id, workspace_id: workspaceId },
+          select: { id: true, name: true, ticket_prefix: true, github_repo: true, github_sync_enabled: true },
+        })
+      : null
+
+    const parsedTask = mapTaskRow({
+      ...(updatedTask as any),
+      project_name: updatedProject?.name ?? null,
+      project_prefix: updatedProject?.ticket_prefix ?? null,
+    });
 
     // Fire-and-forget outbound GitHub sync for relevant changes
     const syncRelevantChanges = changes.some(c =>
       c.startsWith('status:') || c.startsWith('priority:') || c.includes('title') || c.includes('assigned')
     )
-    if (syncRelevantChanges && (updatedTask as any).github_repo) {
-      const project = db.prepare(`
-        SELECT id, github_repo, github_sync_enabled FROM projects
-        WHERE id = ? AND workspace_id = ?
-      `).get((updatedTask as any).project_id, workspaceId) as any
-      if (project?.github_sync_enabled) {
-        pushTaskToGitHub(updatedTask as any, project).catch(err =>
-          logger.error({ err, taskId }, 'Outbound GitHub sync failed')
-        )
-      }
+    if (syncRelevantChanges && (updatedTask as any).github_repo && updatedProject?.github_sync_enabled) {
+      pushTaskToGitHub(updatedTask as any, updatedProject as any).catch(err =>
+        logger.error({ err, taskId }, 'Outbound GitHub sync failed')
+      )
     }
 
     // Broadcast to SSE clients
@@ -419,14 +372,14 @@ export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = requireRole(request, 'operator');
+  const auth = await requireRole(request, 'operator');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   const rateCheck = mutationLimiter(request);
   if (rateCheck) return rateCheck;
 
   try {
-    const db = getDatabase();
+    const prisma = getPrismaClient();
     const resolvedParams = await params;
     const taskId = parseInt(resolvedParams.id);
     const workspaceId = auth.user.workspace_id ?? 1;
@@ -436,17 +389,16 @@ export async function DELETE(
     }
     
     // Get task before deletion for logging
-    const task = db
-      .prepare('SELECT * FROM tasks WHERE id = ? AND workspace_id = ?')
-      .get(taskId, workspaceId) as Task;
+    const task = await prisma.tasks.findFirst({
+      where: { id: taskId, workspace_id: workspaceId },
+    }) as unknown as Task | null;
     
     if (!task) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 });
     }
     
     // Delete task (cascades will handle comments)
-    const stmt = db.prepare('DELETE FROM tasks WHERE id = ? AND workspace_id = ?');
-    stmt.run(taskId, workspaceId);
+    await prisma.tasks.deleteMany({ where: { id: taskId, workspace_id: workspaceId } })
     
     // Log deletion
     db_helpers.logActivity(

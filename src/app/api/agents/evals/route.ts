@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getDatabase } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { readLimiter, mutationLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
+import { getPrismaClient } from '@/lib/prisma'
 import {
   runOutputEvals,
   evalReasoningCoherence,
@@ -13,7 +13,7 @@ import {
 } from '@/lib/agent-evals'
 
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = readLimiter(request)
@@ -32,17 +32,16 @@ export async function GET(request: NextRequest) {
     // History mode
     if (action === 'history') {
       const weeks = parseInt(searchParams.get('weeks') || '4', 10)
-      const db = getDatabase()
+      const prisma = getPrismaClient()
 
-      const history = db.prepare(`
-        SELECT eval_layer, score, passed, detail, created_at
-        FROM eval_runs
-        WHERE agent_name = ? AND workspace_id = ?
-        ORDER BY created_at DESC
-        LIMIT ?
-      `).all(agent, workspaceId, weeks * 7) as any[]
+      const history = await prisma.eval_runs.findMany({
+        where: { agent_name: agent, workspace_id: workspaceId },
+        select: { eval_layer: true, score: true, passed: true, detail: true, created_at: true },
+        orderBy: { created_at: 'desc' },
+        take: weeks * 7,
+      })
 
-      const driftTimeline = getDriftTimeline(agent, weeks, workspaceId)
+      const driftTimeline = await getDriftTimeline(agent, weeks, workspaceId)
 
       return NextResponse.json({
         agent,
@@ -52,20 +51,22 @@ export async function GET(request: NextRequest) {
     }
 
     // Default: latest eval results per layer
-    const db = getDatabase()
-    const latestByLayer = db.prepare(`
-      SELECT e.eval_layer, e.score, e.passed, e.detail, e.created_at
-      FROM eval_runs e
-      INNER JOIN (
-        SELECT eval_layer, MAX(created_at) as max_created
-        FROM eval_runs
-        WHERE agent_name = ? AND workspace_id = ?
-        GROUP BY eval_layer
-      ) latest ON e.eval_layer = latest.eval_layer AND e.created_at = latest.max_created
-      WHERE e.agent_name = ? AND e.workspace_id = ?
-    `).all(agent, workspaceId, agent, workspaceId) as any[]
+    const prisma = getPrismaClient()
+    const recentRuns = await prisma.eval_runs.findMany({
+      where: { agent_name: agent, workspace_id: workspaceId },
+      select: { eval_layer: true, score: true, passed: true, detail: true, created_at: true },
+      orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
+      take: 500,
+    })
+    const seen = new Set<string>()
+    const latestByLayer: any[] = []
+    for (const row of recentRuns) {
+      if (seen.has(row.eval_layer)) continue
+      seen.add(row.eval_layer)
+      latestByLayer.push(row)
+    }
 
-    const driftResults = runDriftCheck(agent, workspaceId)
+    const driftResults = await runDriftCheck(agent, workspaceId)
     const hasDrift = driftResults.some(d => d.drifted)
 
     return NextResponse.json({
@@ -88,7 +89,7 @@ export async function POST(request: NextRequest) {
     const { action } = body
 
     if (action === 'run') {
-      const auth = requireRole(request, 'operator')
+      const auth = await requireRole(request, 'operator')
       if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
       const rateCheck = mutationLimiter(request)
@@ -98,7 +99,8 @@ export async function POST(request: NextRequest) {
       if (!agent) return NextResponse.json({ error: 'Missing: agent' }, { status: 400 })
 
       const workspaceId = auth.user.workspace_id ?? 1
-      const db = getDatabase()
+      const prisma = getPrismaClient()
+      const now = Math.floor(Date.now() / 1000)
       const results: EvalResult[] = []
 
       const layers = layer ? [layer] : ['output', 'trace', 'component', 'drift']
@@ -107,16 +109,16 @@ export async function POST(request: NextRequest) {
         let evalResults: EvalResult[] = []
         switch (l) {
           case 'output':
-            evalResults = runOutputEvals(agent, 168, workspaceId)
+            evalResults = await runOutputEvals(agent, 168, workspaceId)
             break
           case 'trace':
-            evalResults = [evalReasoningCoherence(agent, 24, workspaceId)]
+            evalResults = [await evalReasoningCoherence(agent, 24, workspaceId)]
             break
           case 'component':
-            evalResults = [evalToolReliability(agent, 24, workspaceId)]
+            evalResults = [await evalToolReliability(agent, 24, workspaceId)]
             break
           case 'drift': {
-            const driftResults = runDriftCheck(agent, workspaceId)
+            const driftResults = await runDriftCheck(agent, workspaceId)
             const driftScore = driftResults.filter(d => !d.drifted).length / Math.max(driftResults.length, 1)
             evalResults = [{
               layer: 'drift',
@@ -129,10 +131,18 @@ export async function POST(request: NextRequest) {
         }
 
         for (const r of evalResults) {
-          db.prepare(`
-            INSERT INTO eval_runs (agent_name, eval_layer, score, passed, detail, workspace_id)
-            VALUES (?, ?, ?, ?, ?, ?)
-          `).run(agent, r.layer, r.score, r.passed ? 1 : 0, r.detail, workspaceId)
+          await prisma.eval_runs.create({
+            data: {
+              agent_name: agent,
+              eval_layer: r.layer,
+              score: r.score,
+              passed: r.passed ? 1 : 0,
+              detail: r.detail,
+              workspace_id: workspaceId,
+              created_at: now,
+            },
+            select: { id: true },
+          })
           results.push(r)
         }
       }
@@ -141,7 +151,7 @@ export async function POST(request: NextRequest) {
     }
 
     if (action === 'golden-set') {
-      const auth = requireRole(request, 'admin')
+      const auth = await requireRole(request, 'admin')
       if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
       const rateCheck = mutationLimiter(request)
@@ -151,14 +161,25 @@ export async function POST(request: NextRequest) {
       if (!name) return NextResponse.json({ error: 'Missing: name' }, { status: 400 })
 
       const workspaceId = auth.user.workspace_id ?? 1
-      const db = getDatabase()
+      const prisma = getPrismaClient()
+      const now = Math.floor(Date.now() / 1000)
 
-      db.prepare(`
-        INSERT INTO eval_golden_sets (name, entries, created_by, workspace_id)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(name, workspace_id)
-        DO UPDATE SET entries = excluded.entries, updated_at = unixepoch()
-      `).run(name, JSON.stringify(entries || []), auth.user.username, workspaceId)
+      await prisma.eval_golden_sets.upsert({
+        where: { name_workspace_id: { name, workspace_id: workspaceId } } as any,
+        create: {
+          name,
+          entries: JSON.stringify(entries || []),
+          created_by: auth.user.username,
+          workspace_id: workspaceId,
+          created_at: now,
+          updated_at: now,
+        },
+        update: {
+          entries: JSON.stringify(entries || []),
+          updated_at: now,
+        },
+        select: { id: true },
+      })
 
       return NextResponse.json({ success: true, name })
     }

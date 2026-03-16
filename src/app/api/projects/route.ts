@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getDatabase } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { mutationLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
-import { ensureTenantWorkspaceAccess, ForbiddenError } from '@/lib/workspaces'
+import { ensureTenantWorkspaceAccessAsync, ForbiddenError } from '@/lib/workspaces'
+import { getPrismaClient } from '@/lib/prisma'
 
 function slugify(input: string): string {
   return input
@@ -20,15 +20,15 @@ function normalizePrefix(input: string): string {
 }
 
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const workspaceId = auth.user.workspace_id ?? 1
     const tenantId = auth.user.tenant_id ?? 1
     const forwardedFor = (request.headers.get('x-forwarded-for') || '').split(',')[0]?.trim() || null
-    ensureTenantWorkspaceAccess(db, tenantId, workspaceId, {
+    await ensureTenantWorkspaceAccessAsync(tenantId, workspaceId, {
       actor: auth.user.username,
       actorId: auth.user.id,
       route: '/api/projects',
@@ -37,21 +37,54 @@ export async function GET(request: NextRequest) {
     })
     const includeArchived = new URL(request.url).searchParams.get('includeArchived') === '1'
 
-    const rows = db.prepare(`
-      SELECT p.id, p.workspace_id, p.name, p.slug, p.description, p.ticket_prefix, p.ticket_counter, p.status,
-             p.github_repo, p.deadline, p.color, p.github_sync_enabled, p.github_labels_initialized, p.github_default_branch, p.created_at, p.updated_at,
-             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) as task_count,
-             (SELECT GROUP_CONCAT(paa.agent_name) FROM project_agent_assignments paa WHERE paa.project_id = p.id) as assigned_agents_csv
-      FROM projects p
-      WHERE p.workspace_id = ?
-        ${includeArchived ? '' : "AND p.status = 'active'"}
-      ORDER BY p.name COLLATE NOCASE ASC
-    `).all(workspaceId) as Array<Record<string, unknown>>
+    const rows = await prisma.projects.findMany({
+      where: {
+        workspace_id: workspaceId,
+        ...(includeArchived ? {} : { status: 'active' }),
+      },
+      select: {
+        id: true,
+        workspace_id: true,
+        name: true,
+        slug: true,
+        description: true,
+        ticket_prefix: true,
+        ticket_counter: true,
+        status: true,
+        github_repo: true,
+        deadline: true,
+        color: true,
+        github_sync_enabled: true,
+        github_labels_initialized: true,
+        github_default_branch: true,
+        created_at: true,
+        updated_at: true,
+        project_agent_assignments: { select: { agent_name: true } },
+      },
+    })
 
-    const projects = rows.map(row => ({
-      ...row,
-      assigned_agents: row.assigned_agents_csv ? String(row.assigned_agents_csv).split(',') : [],
-      assigned_agents_csv: undefined,
+    const sorted = [...rows].sort((a, b) =>
+      String(a.name).localeCompare(String(b.name), undefined, { sensitivity: 'base' })
+    )
+
+    const ids = sorted.map((p) => p.id)
+    const counts = ids.length === 0
+      ? []
+      : await prisma.tasks.groupBy({
+          by: ['project_id'],
+          where: { project_id: { in: ids } },
+          _count: { _all: true },
+        })
+    const countMap = new Map<number, number>()
+    for (const row of counts as any[]) {
+      if (typeof row.project_id === 'number') countMap.set(row.project_id, row._count?._all ?? 0)
+    }
+
+    const projects = sorted.map((p) => ({
+      ...p,
+      task_count: countMap.get(p.id) ?? 0,
+      assigned_agents: (p as any).project_agent_assignments?.map((a: any) => a.agent_name) ?? [],
+      project_agent_assignments: undefined,
     }))
 
     return NextResponse.json({ projects })
@@ -65,18 +98,18 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const rateCheck = mutationLimiter(request)
   if (rateCheck) return rateCheck
 
   try {
-    const db = getDatabase()
+    const prisma = getPrismaClient()
     const workspaceId = auth.user.workspace_id ?? 1
     const tenantId = auth.user.tenant_id ?? 1
     const forwardedFor = (request.headers.get('x-forwarded-for') || '').split(',')[0]?.trim() || null
-    ensureTenantWorkspaceAccess(db, tenantId, workspaceId, {
+    await ensureTenantWorkspaceAccessAsync(tenantId, workspaceId, {
       actor: auth.user.username,
       actorId: auth.user.id,
       route: '/api/projects',
@@ -100,26 +133,48 @@ export async function POST(request: NextRequest) {
     if (!slug) return NextResponse.json({ error: 'Invalid project slug' }, { status: 400 })
     if (!ticketPrefix) return NextResponse.json({ error: 'Invalid ticket prefix' }, { status: 400 })
 
-    const exists = db.prepare(`
-      SELECT id FROM projects
-      WHERE workspace_id = ? AND (slug = ? OR ticket_prefix = ?)
-      LIMIT 1
-    `).get(workspaceId, slug, ticketPrefix) as { id: number } | undefined
-    if (exists) {
-      return NextResponse.json({ error: 'Project slug or ticket prefix already exists' }, { status: 409 })
+    const now = Math.floor(Date.now() / 1000)
+    let project: any
+    try {
+      project = await prisma.projects.create({
+        data: {
+          workspace_id: workspaceId,
+          name,
+          slug,
+          description: description || null,
+          ticket_prefix: ticketPrefix,
+          github_repo: githubRepo,
+          deadline,
+          color,
+          status: 'active',
+          created_at: now,
+          updated_at: now,
+        },
+        select: {
+          id: true,
+          workspace_id: true,
+          name: true,
+          slug: true,
+          description: true,
+          ticket_prefix: true,
+          ticket_counter: true,
+          status: true,
+          github_repo: true,
+          deadline: true,
+          color: true,
+          github_sync_enabled: true,
+          github_labels_initialized: true,
+          github_default_branch: true,
+          created_at: true,
+          updated_at: true,
+        },
+      })
+    } catch (err: any) {
+      if (err?.code === 'P2002') {
+        return NextResponse.json({ error: 'Project slug or ticket prefix already exists' }, { status: 409 })
+      }
+      throw err
     }
-
-    const result = db.prepare(`
-      INSERT INTO projects (workspace_id, name, slug, description, ticket_prefix, github_repo, deadline, color, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', unixepoch(), unixepoch())
-    `).run(workspaceId, name, slug, description || null, ticketPrefix, githubRepo, deadline, color)
-
-    const project = db.prepare(`
-      SELECT id, workspace_id, name, slug, description, ticket_prefix, ticket_counter, status,
-             github_repo, deadline, color, github_sync_enabled, github_labels_initialized, github_default_branch, created_at, updated_at
-      FROM projects
-      WHERE id = ?
-    `).get(Number(result.lastInsertRowid))
 
     return NextResponse.json({ project }, { status: 201 })
   } catch (error) {

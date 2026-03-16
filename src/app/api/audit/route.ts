@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
-import { getDatabase } from '@/lib/db'
+import { getPrismaClient } from '@/lib/prisma'
 
 function safeParseJson(str: string): any {
   try { return JSON.parse(str) } catch { return str }
@@ -11,7 +11,7 @@ function safeParseJson(str: string): any {
  * Query params: action, actor, limit, offset, since, until
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const { searchParams } = new URL(request.url)
@@ -22,37 +22,26 @@ export async function GET(request: NextRequest) {
   const since = searchParams.get('since')
   const until = searchParams.get('until')
 
-  const conditions: string[] = []
-  const params: any[] = []
-
-  if (action) {
-    conditions.push('action = ?')
-    params.push(action)
-  }
-  if (actor) {
-    conditions.push('actor = ?')
-    params.push(actor)
-  }
-  if (since) {
-    conditions.push('created_at >= ?')
-    params.push(parseInt(since))
-  }
-  if (until) {
-    conditions.push('created_at <= ?')
-    params.push(parseInt(until))
+  const prisma = getPrismaClient()
+  const where: any = {}
+  if (action) where.action = action
+  if (actor) where.actor = actor
+  const sinceInt = since ? parseInt(since) : NaN
+  const untilInt = until ? parseInt(until) : NaN
+  if (!Number.isNaN(sinceInt) || !Number.isNaN(untilInt)) {
+    where.created_at = {
+      ...(!Number.isNaN(sinceInt) ? { gte: sinceInt } : {}),
+      ...(!Number.isNaN(untilInt) ? { lte: untilInt } : {}),
+    }
   }
 
-  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
-
-  const db = getDatabase()
-
-  const total = (db.prepare(`SELECT COUNT(*) as count FROM audit_log ${where}`).get(...params) as any).count
-
-  const rows = db.prepare(`
-    SELECT * FROM audit_log ${where}
-    ORDER BY created_at DESC
-    LIMIT ? OFFSET ?
-  `).all(...params, limit, offset)
+  const total = await prisma.audit_log.count({ where })
+  const rows = await prisma.audit_log.findMany({
+    where,
+    orderBy: { created_at: 'desc' },
+    take: limit,
+    skip: offset,
+  })
 
   return NextResponse.json({
     events: rows.map((row: any) => ({

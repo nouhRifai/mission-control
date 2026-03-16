@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
 import { runOpenClaw } from '@/lib/command'
 import { config } from '@/lib/config'
-import { getDatabase } from '@/lib/db'
+import { logAuditEvent } from '@/lib/db'
 import { logger } from '@/lib/logger'
 import { archiveOrphanTranscriptsForStateDir } from '@/lib/openclaw-doctor-fix'
 import { parseOpenClawDoctorOutput } from '@/lib/openclaw-doctor'
@@ -26,7 +26,7 @@ function isMissingOpenClaw(detail: string): boolean {
 }
 
 export async function GET(request: Request) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) {
     return NextResponse.json({ error: auth.error }, { status: auth.status })
   }
@@ -53,7 +53,7 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) {
     return NextResponse.json({ error: auth.error }, { status: auth.status })
   }
@@ -86,18 +86,12 @@ export async function POST(request: Request) {
       stateDir: config.openclawStateDir,
     })
 
-    try {
-      const db = getDatabase()
-      db.prepare(
-        'INSERT INTO audit_log (action, actor, detail) VALUES (?, ?, ?)'
-      ).run(
-        'openclaw.doctor.fix',
-        auth.user.username,
-        JSON.stringify({ level: status.level, healthy: status.healthy, issues: status.issues })
-      )
-    } catch {
-      // Non-critical.
-    }
+    logAuditEvent({
+      action: 'openclaw.doctor.fix',
+      actor: auth.user.username,
+      actor_id: auth.user.id,
+      detail: { level: status.level, healthy: status.healthy, issues: status.issues },
+    })
 
     return NextResponse.json({
       success: true,

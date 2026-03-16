@@ -1,9 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { safeCompare, requireRole } from '@/lib/auth'
 
-// Mock dependencies that auth.ts imports
-vi.mock('@/lib/db', () => ({
-  getDatabase: vi.fn(),
+vi.mock('@/lib/prisma', () => ({
+  getPrismaClient: () => {
+    throw new Error('prisma not available in unit tests')
+  },
 }))
 
 vi.mock('@/lib/password', () => ({
@@ -58,70 +59,70 @@ describe('requireRole', () => {
   function makeRequest(headers: Record<string, string> = {}): Request {
     return new Request('http://localhost/api/test', {
       headers: new Headers(headers),
-    })
-  }
+	    })
+	  }
 
-  it('returns 401 when no authentication is provided', () => {
-    const result = requireRole(makeRequest(), 'viewer')
-    expect(result.status).toBe(401)
-    expect(result.error).toBe('Authentication required')
-    expect(result.user).toBeUndefined()
-  })
+	  it('returns 401 when no authentication is provided', async () => {
+	    const result = await requireRole(makeRequest(), 'viewer')
+	    expect(result.status).toBe(401)
+	    expect(result.error).toBe('Authentication required')
+	    expect(result.user).toBeUndefined()
+	  })
 
-  it('returns 401 when API key is wrong', () => {
-    const result = requireRole(
-      makeRequest({ 'x-api-key': 'wrong-key' }),
-      'viewer',
-    )
-    expect(result.status).toBe(401)
-    expect(result.error).toBe('Authentication required')
-  })
+	  it('returns 401 when API key is wrong', async () => {
+	    const result = await requireRole(
+	      makeRequest({ 'x-api-key': 'wrong-key' }),
+	      'viewer',
+	    )
+	    expect(result.status).toBe(401)
+	    expect(result.error).toBe('Authentication required')
+	  })
 
-  it('returns user when API key is valid and role is sufficient', () => {
-    const result = requireRole(
-      makeRequest({ 'x-api-key': 'test-api-key-secret' }),
-      'admin',
-    )
-    expect(result.status).toBeUndefined()
+	  it('returns user when API key is valid and role is sufficient', async () => {
+	    const result = await requireRole(
+	      makeRequest({ 'x-api-key': 'test-api-key-secret' }),
+	      'admin',
+	    )
+	    expect(result.status).toBeUndefined()
     expect(result.error).toBeUndefined()
     expect(result.user).toBeDefined()
     expect(result.user!.username).toBe('api')
-    expect(result.user!.role).toBe('admin')
-  })
+	    expect(result.user!.role).toBe('admin')
+	  })
 
-  it('returns user for lower role requirement with API key (admin >= viewer)', () => {
-    const result = requireRole(
-      makeRequest({ 'x-api-key': 'test-api-key-secret' }),
-      'viewer',
-    )
-    expect(result.user).toBeDefined()
-    expect(result.user!.role).toBe('admin')
-  })
+	  it('returns user for lower role requirement with API key (admin >= viewer)', async () => {
+	    const result = await requireRole(
+	      makeRequest({ 'x-api-key': 'test-api-key-secret' }),
+	      'viewer',
+	    )
+	    expect(result.user).toBeDefined()
+	    expect(result.user!.role).toBe('admin')
+	  })
 
-  it('returns user for operator role requirement with API key (admin >= operator)', () => {
-    const result = requireRole(
-      makeRequest({ 'x-api-key': 'test-api-key-secret' }),
-      'operator',
-    )
-    expect(result.user).toBeDefined()
-  })
+	  it('returns user for operator role requirement with API key (admin >= operator)', async () => {
+	    const result = await requireRole(
+	      makeRequest({ 'x-api-key': 'test-api-key-secret' }),
+	      'operator',
+	    )
+	    expect(result.user).toBeDefined()
+	  })
 
-  it('accepts Authorization Bearer API key', () => {
-    const result = requireRole(
-      makeRequest({ authorization: 'Bearer test-api-key-secret' }),
-      'admin',
-    )
-    expect(result.user).toBeDefined()
-    expect(result.user!.username).toBe('api')
-  })
+	  it('accepts Authorization Bearer API key', async () => {
+	    const result = await requireRole(
+	      makeRequest({ authorization: 'Bearer test-api-key-secret' }),
+	      'admin',
+	    )
+	    expect(result.user).toBeDefined()
+	    expect(result.user!.username).toBe('api')
+	  })
 
-  it('rejects API key auth when API_KEY is not configured', () => {
-    process.env = { ...originalEnv, API_KEY: '' }
-    const result = requireRole(
-      makeRequest({ 'x-api-key': 'test-api-key-secret' }),
-      'viewer',
-    )
-    expect(result.status).toBe(401)
+	  it('rejects API key auth when API_KEY is not configured', async () => {
+	    process.env = { ...originalEnv, API_KEY: '' }
+	    const result = await requireRole(
+	      makeRequest({ 'x-api-key': 'test-api-key-secret' }),
+	      'viewer',
+	    )
+	    expect(result.status).toBe(401)
     expect(result.user).toBeUndefined()
   })
 })

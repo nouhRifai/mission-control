@@ -48,7 +48,7 @@ function resolveFlightDeckInstallPath(): string | null {
  * Check Flight Deck local installation status.
  */
 export async function GET(request: NextRequest) {
-  const auth = requireRole(request, 'viewer')
+  const auth = await requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const installPath = resolveFlightDeckInstallPath()
@@ -67,7 +67,7 @@ export async function GET(request: NextRequest) {
  * Build a Flight Deck URL for the selected agent/session.
  */
 export async function POST(request: NextRequest) {
-  const auth = requireRole(request, 'operator')
+  const auth = await requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   const installPath = resolveFlightDeckInstallPath()

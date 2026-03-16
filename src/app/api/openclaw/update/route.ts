@@ -1,11 +1,11 @@
 import { NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
 import { runOpenClaw } from '@/lib/command'
-import { getDatabase } from '@/lib/db'
+import { logAuditEvent } from '@/lib/db'
 import { logger } from '@/lib/logger'
 
 export async function POST(request: Request) {
-  const auth = requireRole(request, 'admin')
+  const auth = await requireRole(request, 'admin')
   if ('error' in auth) {
     return NextResponse.json({ error: auth.error }, { status: auth.status })
   }
@@ -37,16 +37,12 @@ export async function POST(request: Request) {
     } catch { /* keep null */ }
 
     // Audit log
-    try {
-      const db = getDatabase()
-      db.prepare(
-        'INSERT INTO audit_log (action, actor, detail) VALUES (?, ?, ?)'
-      ).run(
-        'openclaw.update',
-        auth.user.username,
-        JSON.stringify({ previousVersion: installedBefore, newVersion: installedAfter })
-      )
-    } catch { /* non-critical */ }
+    logAuditEvent({
+      action: 'openclaw.update',
+      actor: auth.user.username,
+      actor_id: auth.user.id,
+      detail: { previousVersion: installedBefore, newVersion: installedAfter },
+    })
 
     return NextResponse.json({
       success: true,
