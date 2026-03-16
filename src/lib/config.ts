@@ -22,6 +22,13 @@ const resolvedDbPath = isBuildPhase
       path.join(resolvedDataDir, 'mission-control.db'))
   : (process.env.MISSION_CONTROL_DB_PATH ||
       path.join(resolvedDataDir, 'mission-control.db'))
+const resolvedDbProvider =
+  (process.env.MISSION_CONTROL_DB_PROVIDER || 'sqlite').trim().toLowerCase() === 'postgres'
+    ? 'postgres'
+    : 'sqlite'
+const resolvedDatabaseUrl = resolvedDbProvider === 'postgres'
+  ? (process.env.DATABASE_URL || '')
+  : `file:${resolvedDbPath}`
 const resolvedTokensPath = isBuildPhase
   ? (process.env.MISSION_CONTROL_BUILD_TOKENS_PATH ||
       path.join(resolvedDataDir, 'mission-control-tokens.json'))
@@ -64,6 +71,8 @@ const defaultMemoryDir = (() => {
 })()
 
 export const config = {
+  dbProvider: resolvedDbProvider as 'sqlite' | 'postgres',
+  databaseUrl: resolvedDatabaseUrl,
   claudeHome:
     process.env.MC_CLAUDE_HOME ||
     path.join(os.homedir(), '.claude'),

@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: mission-control-postgres
+    environment:
+      POSTGRES_DB: mission_control
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - mc-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mission_control"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  mission-control:
+    environment:
+      MISSION_CONTROL_DB_PROVIDER: postgres
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/mission_control
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  mc-postgres-data:
