@@ -1,0 +1,822 @@
+generator client {
+  provider        = "prisma-client-js"
+  output          = "../src/generated/prisma/sqlite"
+  previewFeatures = ["partialIndexes"]
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model access_requests {
+  id               Int     @id @default(autoincrement())
+  provider         String  @default("google")
+  email            String
+  provider_user_id String?
+  display_name     String?
+  avatar_url       String?
+  status           String  @default("pending")
+  requested_at     Int     @default(dbgenerated("unixepoch()"))
+  last_attempt_at  Int     @default(dbgenerated("unixepoch()"))
+  attempt_count    Int     @default(1)
+  reviewed_by      String?
+  reviewed_at      Int?
+  review_note      String?
+  approved_user_id Int?
+  users            users?  @relation(fields: [approved_user_id], references: [id], onUpdate: NoAction)
+
+  @@unique([email, provider], map: "idx_access_requests_email_provider")
+  @@index([status], map: "idx_access_requests_status")
+}
+
+model activities {
+  id           Int     @id @default(autoincrement())
+  type         String
+  entity_type  String
+  entity_id    Int
+  actor        String
+  description  String
+  data         String?
+  created_at   Int     @default(dbgenerated("unixepoch()"))
+  workspace_id Int     @default(1)
+
+  @@index([workspace_id], map: "idx_activities_workspace_id")
+  @@index([entity_type, entity_id], map: "idx_activities_entity")
+  @@index([actor], map: "idx_activities_actor")
+  @@index([type], map: "idx_activities_type")
+  @@index([created_at], map: "idx_activities_created_at")
+}
+
+model adapter_configs {
+  id           Int        @id @default(autoincrement())
+  workspace_id Int
+  framework    String
+  config       String?    @default("{}")
+  enabled      Int        @default(1)
+  created_at   Int        @default(dbgenerated("unixepoch()"))
+  updated_at   Int        @default(dbgenerated("unixepoch()"))
+  workspaces   workspaces @relation(fields: [workspace_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([workspace_id, framework], map: "idx_adapter_configs_workspace_framework")
+}
+
+model agent_api_keys {
+  id           Int     @id @default(autoincrement())
+  agent_id     Int
+  workspace_id Int     @default(1)
+  name         String
+  key_hash     String
+  key_prefix   String
+  scopes       String  @default("[]")
+  expires_at   Int?
+  revoked_at   Int?
+  last_used_at Int?
+  created_by   String?
+  created_at   Int     @default(dbgenerated("unixepoch()"))
+  updated_at   Int     @default(dbgenerated("unixepoch()"))
+
+  @@unique([workspace_id, key_hash], map: "sqlite_autoindex_agent_api_keys_1")
+  @@index([revoked_at], map: "idx_agent_api_keys_revoked_at")
+  @@index([expires_at], map: "idx_agent_api_keys_expires_at")
+  @@index([workspace_id], map: "idx_agent_api_keys_workspace_id")
+  @@index([agent_id], map: "idx_agent_api_keys_agent_id")
+}
+
+model agent_trust_scores {
+  id                 Int    @id @default(autoincrement())
+  agent_name         String
+  trust_score        Float  @default(1.0)
+  auth_failures      Int    @default(0)
+  injection_attempts Int    @default(0)
+  rate_limit_hits    Int    @default(0)
+  secret_exposures   Int    @default(0)
+  successful_tasks   Int    @default(0)
+  failed_tasks       Int    @default(0)
+  last_anomaly_at    Int?
+  workspace_id       Int    @default(1)
+  updated_at         Int    @default(dbgenerated("unixepoch()"))
+
+  @@unique([agent_name, workspace_id], map: "sqlite_autoindex_agent_trust_scores_1")
+}
+
+model agents {
+  id                 Int                  @id @default(autoincrement())
+  name               String               @unique(map: "sqlite_autoindex_agents_1")
+  role               String
+  session_key        String?              @unique(map: "sqlite_autoindex_agents_2")
+  soul_content       String?
+  working_memory     String               @default("")
+  status             String               @default("offline")
+  last_seen          Int?
+  last_activity      String?
+  created_at         Int                  @default(dbgenerated("unixepoch()"))
+  updated_at         Int                  @default(dbgenerated("unixepoch()"))
+  config             String?
+  workspace_id       Int                  @default(1)
+  source             String?              @default("manual")
+  content_hash       String?
+  workspace_path     String?
+  direct_connections direct_connections[]
+
+  @@index([source], map: "idx_agents_source")
+  @@index([workspace_id], map: "idx_agents_workspace_id")
+  @@index([status], map: "idx_agents_status")
+  @@index([session_key], map: "idx_agents_session_key")
+}
+
+model alert_rules {
+  id                 Int     @id @default(autoincrement())
+  name               String
+  description        String?
+  enabled            Int     @default(1)
+  entity_type        String
+  condition_field    String
+  condition_operator String
+  condition_value    String
+  action_type        String  @default("notification")
+  action_config      String  @default("{}")
+  cooldown_minutes   Int     @default(60)
+  last_triggered_at  Int?
+  trigger_count      Int     @default(0)
+  created_by         String  @default("system")
+  created_at         Int     @default(dbgenerated("unixepoch()"))
+  updated_at         Int     @default(dbgenerated("unixepoch()"))
+  workspace_id       Int     @default(1)
+
+  @@index([workspace_id], map: "idx_alert_rules_workspace_id")
+  @@index([entity_type], map: "idx_alert_rules_entity_type")
+  @@index([enabled], map: "idx_alert_rules_enabled")
+}
+
+model api_keys {
+  id           Int     @id @default(autoincrement())
+  user_id      Int
+  label        String
+  key_prefix   String
+  key_hash     String  @unique(map: "sqlite_autoindex_api_keys_1")
+  role         String  @default("viewer")
+  scopes       String?
+  expires_at   Int?
+  last_used_at Int?
+  last_used_ip String?
+  workspace_id Int     @default(1)
+  tenant_id    Int     @default(1)
+  is_revoked   Int     @default(0)
+  created_at   Int     @default(dbgenerated("unixepoch()"))
+  updated_at   Int     @default(dbgenerated("unixepoch()"))
+
+  @@index([key_prefix], map: "idx_api_keys_prefix")
+  @@index([workspace_id], map: "idx_api_keys_workspace_id")
+  @@index([user_id], map: "idx_api_keys_user_id")
+  @@index([key_hash], map: "idx_api_keys_key_hash")
+}
+
+model audit_log {
+  id          Int     @id @default(autoincrement())
+  action      String
+  actor       String
+  actor_id    Int?
+  target_type String?
+  target_id   Int?
+  detail      String?
+  ip_address  String?
+  user_agent  String?
+  created_at  Int     @default(dbgenerated("unixepoch()"))
+
+  @@index([created_at], map: "idx_audit_log_created_at")
+  @@index([actor], map: "idx_audit_log_actor")
+  @@index([action], map: "idx_audit_log_action")
+}
+
+model claude_sessions {
+  id                 Int     @id @default(autoincrement())
+  session_id         String  @unique(map: "sqlite_autoindex_claude_sessions_1")
+  project_slug       String
+  project_path       String?
+  model              String?
+  git_branch         String?
+  user_messages      Int     @default(0)
+  assistant_messages Int     @default(0)
+  tool_uses          Int     @default(0)
+  input_tokens       Int     @default(0)
+  output_tokens      Int     @default(0)
+  estimated_cost     Float   @default(0)
+  first_message_at   String?
+  last_message_at    String?
+  last_user_prompt   String?
+  is_active          Int     @default(0)
+  scanned_at         Int
+  created_at         Int     @default(dbgenerated("unixepoch()"))
+  updated_at         Int     @default(dbgenerated("unixepoch()"))
+
+  @@index([project_slug], map: "idx_claude_sessions_project")
+  @@index([is_active], map: "idx_claude_sessions_active", where: raw("is_active = 1"))
+}
+
+model comments {
+  id             Int        @id @default(autoincrement())
+  task_id        Int
+  author         String
+  content        String
+  created_at     Int        @default(dbgenerated("unixepoch()"))
+  parent_id      Int?
+  mentions       String?
+  workspace_id   Int        @default(1)
+  comments       comments?  @relation("commentsTocomments", fields: [parent_id], references: [id], onUpdate: NoAction)
+  other_comments comments[] @relation("commentsTocomments")
+  tasks          tasks      @relation(fields: [task_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([workspace_id], map: "idx_comments_workspace_id")
+  @@index([created_at], map: "idx_comments_created_at")
+  @@index([task_id], map: "idx_comments_task_id")
+}
+
+model direct_connections {
+  id             Int     @id @default(autoincrement())
+  agent_id       Int
+  tool_name      String
+  tool_version   String?
+  connection_id  String  @unique(map: "sqlite_autoindex_direct_connections_1")
+  status         String  @default("connected")
+  last_heartbeat Int?
+  metadata       String?
+  created_at     Int     @default(dbgenerated("unixepoch()"))
+  updated_at     Int     @default(dbgenerated("unixepoch()"))
+  workspace_id   Int     @default(1)
+  agents         agents  @relation(fields: [agent_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([workspace_id], map: "idx_direct_connections_workspace_id")
+  @@index([status], map: "idx_direct_connections_status")
+  @@index([connection_id], map: "idx_direct_connections_connection_id")
+  @@index([agent_id], map: "idx_direct_connections_agent_id")
+}
+
+model eval_golden_sets {
+  id           Int     @id @default(autoincrement())
+  name         String
+  description  String?
+  entries      String  @default("[]")
+  created_by   String?
+  workspace_id Int     @default(1)
+  created_at   Int     @default(dbgenerated("unixepoch()"))
+  updated_at   Int     @default(dbgenerated("unixepoch()"))
+
+  @@unique([name, workspace_id], map: "sqlite_autoindex_eval_golden_sets_1")
+}
+
+model eval_runs {
+  id                Int     @id @default(autoincrement())
+  agent_name        String
+  eval_layer        String
+  score             Float?
+  passed            Int?
+  detail            String?
+  golden_dataset_id Int?
+  workspace_id      Int     @default(1)
+  created_at        Int     @default(dbgenerated("unixepoch()"))
+
+  @@index([created_at], map: "idx_eval_runs_created_at")
+  @@index([eval_layer], map: "idx_eval_runs_eval_layer")
+  @@index([agent_name], map: "idx_eval_runs_agent_name")
+}
+
+model eval_traces {
+  id                Int    @id @default(autoincrement())
+  agent_name        String
+  task_id           Int?
+  trace             String @default("[]")
+  convergence_score Float?
+  total_steps       Int?
+  optimal_steps     Int?
+  workspace_id      Int    @default(1)
+  created_at        Int    @default(dbgenerated("unixepoch()"))
+
+  @@index([task_id], map: "idx_eval_traces_task_id")
+  @@index([agent_name], map: "idx_eval_traces_agent_name")
+}
+
+model gateway_health_logs {
+  id         Int     @id @default(autoincrement())
+  gateway_id Int
+  status     String
+  latency    Int?
+  probed_at  Int     @default(dbgenerated("unixepoch()"))
+  error      String?
+
+  @@index([probed_at], map: "idx_gateway_health_logs_probed_at")
+  @@index([gateway_id], map: "idx_gateway_health_logs_gateway_id")
+}
+
+model gateways {
+  id             Int    @id @default(autoincrement())
+  name           String @unique(map: "sqlite_autoindex_gateways_1")
+  host           String @default("127.0.0.1")
+  port           Int    @default(18789)
+  token          String @default("")
+  is_primary     Int    @default(0)
+  status         String @default("unknown")
+  last_seen      Int?
+  latency        Int?
+  sessions_count Int    @default(0)
+  agents_count   Int    @default(0)
+  created_at     Int    @default(dbgenerated("unixepoch()"))
+  updated_at     Int    @default(dbgenerated("unixepoch()"))
+}
+
+model github_syncs {
+  id             Int     @id @default(autoincrement())
+  repo           String
+  last_synced_at Int     @default(dbgenerated("unixepoch()"))
+  issue_count    Int     @default(0)
+  sync_direction String  @default("inbound")
+  status         String  @default("success")
+  error          String?
+  created_at     Int     @default(dbgenerated("unixepoch()"))
+  workspace_id   Int     @default(1)
+  project_id     Int?
+  changes_pushed Int     @default(0)
+  changes_pulled Int     @default(0)
+
+  @@index([project_id], map: "idx_github_syncs_project")
+  @@index([workspace_id], map: "idx_github_syncs_workspace_id")
+  @@index([created_at], map: "idx_github_syncs_created_at")
+  @@index([repo], map: "idx_github_syncs_repo")
+}
+
+model mcp_call_log {
+  id           Int     @id @default(autoincrement())
+  agent_name   String?
+  mcp_server   String?
+  tool_name    String?
+  success      Int     @default(1)
+  duration_ms  Int?
+  error        String?
+  workspace_id Int     @default(1)
+  created_at   Int     @default(dbgenerated("unixepoch()"))
+
+  @@index([tool_name], map: "idx_mcp_call_log_tool_name")
+  @@index([created_at], map: "idx_mcp_call_log_created_at")
+  @@index([agent_name], map: "idx_mcp_call_log_agent_name")
+}
+
+model messages {
+  id              Int     @id @default(autoincrement())
+  conversation_id String
+  from_agent      String
+  to_agent        String?
+  content         String
+  message_type    String? @default("text")
+  metadata        String?
+  read_at         Int?
+  created_at      Int?    @default(dbgenerated("unixepoch()"))
+  workspace_id    Int     @default(1)
+
+  @@index([workspace_id], map: "idx_messages_workspace_id")
+  @@index([read_at], map: "idx_messages_read_at")
+  @@index([from_agent, to_agent], map: "idx_messages_agents")
+  @@index([conversation_id, created_at], map: "idx_messages_conversation")
+}
+
+model notifications {
+  id           Int     @id @default(autoincrement())
+  recipient    String
+  type         String
+  title        String
+  message      String
+  source_type  String?
+  source_id    Int?
+  read_at      Int?
+  delivered_at Int?
+  created_at   Int     @default(dbgenerated("unixepoch()"))
+  workspace_id Int     @default(1)
+
+  @@index([workspace_id], map: "idx_notifications_workspace_id")
+  @@index([recipient, read_at], map: "idx_notifications_recipient_read")
+  @@index([read_at], map: "idx_notifications_read_at")
+  @@index([created_at], map: "idx_notifications_created_at")
+  @@index([recipient], map: "idx_notifications_recipient")
+}
+
+model pipeline_runs {
+  id                 Int                @id @default(autoincrement())
+  pipeline_id        Int
+  status             String             @default("pending")
+  current_step       Int                @default(0)
+  steps_snapshot     String             @default("[]")
+  started_at         Int?
+  completed_at       Int?
+  triggered_by       String             @default("system")
+  created_at         Int                @default(dbgenerated("unixepoch()"))
+  workspace_id       Int                @default(1)
+  workflow_pipelines workflow_pipelines @relation(fields: [pipeline_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([workspace_id], map: "idx_pipeline_runs_workspace_id")
+  @@index([status], map: "idx_pipeline_runs_status")
+  @@index([pipeline_id], map: "idx_pipeline_runs_pipeline_id")
+}
+
+model project_agent_assignments {
+  id          Int      @id @default(autoincrement())
+  project_id  Int
+  agent_name  String
+  role        String?  @default("member")
+  assigned_at Int      @default(dbgenerated("unixepoch()"))
+  projects    projects @relation(fields: [project_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([project_id, agent_name], map: "sqlite_autoindex_project_agent_assignments_1")
+  @@index([agent_name], map: "idx_paa_agent")
+  @@index([project_id], map: "idx_paa_project")
+}
+
+model projects {
+  id                        Int                         @id @default(autoincrement())
+  workspace_id              Int                         @default(1)
+  name                      String
+  slug                      String
+  description               String?
+  ticket_prefix             String
+  ticket_counter            Int                         @default(0)
+  status                    String                      @default("active")
+  created_at                Int                         @default(dbgenerated("unixepoch()"))
+  updated_at                Int                         @default(dbgenerated("unixepoch()"))
+  github_repo               String?
+  deadline                  Int?
+  color                     String?
+  metadata                  String?
+  github_sync_enabled       Int                         @default(0)
+  github_labels_initialized Int                         @default(0)
+  github_default_branch     String?                     @default("main")
+  project_agent_assignments project_agent_assignments[]
+
+  @@unique([workspace_id, ticket_prefix], map: "sqlite_autoindex_projects_2")
+  @@unique([workspace_id, slug], map: "sqlite_autoindex_projects_1")
+  @@index([workspace_id, status], map: "idx_projects_workspace_status")
+}
+
+model provision_events {
+  id             Int            @id @default(autoincrement())
+  job_id         Int
+  level          String         @default("info")
+  step_key       String?
+  message        String
+  data           String?
+  created_at     Int            @default(dbgenerated("unixepoch()"))
+  provision_jobs provision_jobs @relation(fields: [job_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([created_at], map: "idx_provision_events_created_at")
+  @@index([job_id], map: "idx_provision_events_job_id")
+}
+
+model provision_jobs {
+  id               Int                @id @default(autoincrement())
+  tenant_id        Int
+  job_type         String             @default("bootstrap")
+  status           String             @default("queued")
+  dry_run          Int                @default(1)
+  requested_by     String             @default("system")
+  approved_by      String?
+  runner_host      String?
+  idempotency_key  String?
+  request_json     String             @default("{}")
+  plan_json        String             @default("[]")
+  result_json      String?
+  error_text       String?
+  started_at       Int?
+  completed_at     Int?
+  created_at       Int                @default(dbgenerated("unixepoch()"))
+  updated_at       Int                @default(dbgenerated("unixepoch()"))
+  provision_events provision_events[]
+  tenants          tenants            @relation(fields: [tenant_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([created_at], map: "idx_provision_jobs_created_at")
+  @@index([status], map: "idx_provision_jobs_status")
+  @@index([tenant_id], map: "idx_provision_jobs_tenant_id")
+}
+
+model quality_reviews {
+  id           Int     @id @default(autoincrement())
+  task_id      Int
+  reviewer     String
+  status       String
+  notes        String?
+  created_at   Int     @default(dbgenerated("unixepoch()"))
+  workspace_id Int     @default(1)
+  tasks        tasks   @relation(fields: [task_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([workspace_id], map: "idx_quality_reviews_workspace_id")
+  @@index([reviewer], map: "idx_quality_reviews_reviewer")
+  @@index([task_id], map: "idx_quality_reviews_task_id")
+}
+
+/// The underlying table does not contain a valid unique identifier and can therefore currently not be handled by Prisma Client.
+model schema_migrations {
+  id         String @id
+  applied_at Int    @default(dbgenerated("unixepoch()"))
+
+  @@ignore
+}
+
+model security_events {
+  id           Int     @id @default(autoincrement())
+  event_type   String
+  severity     String  @default("info")
+  source       String?
+  agent_name   String?
+  detail       String?
+  ip_address   String?
+  workspace_id Int     @default(1)
+  tenant_id    Int     @default(1)
+  created_at   Int     @default(dbgenerated("unixepoch()"))
+
+  @@index([workspace_id], map: "idx_security_events_workspace_id")
+  @@index([agent_name], map: "idx_security_events_agent_name")
+  @@index([created_at], map: "idx_security_events_created_at")
+  @@index([severity], map: "idx_security_events_severity")
+  @@index([event_type], map: "idx_security_events_event_type")
+}
+
+/// The underlying table does not contain a valid unique identifier and can therefore currently not be handled by Prisma Client.
+model settings {
+  key         String  @id
+  value       String
+  description String?
+  category    String  @default("general")
+  updated_by  String?
+  updated_at  Int     @default(dbgenerated("unixepoch()"))
+
+  @@index([category], map: "idx_settings_category")
+}
+
+model skills {
+  id               Int     @id @default(autoincrement())
+  name             String
+  source           String
+  path             String
+  description      String?
+  content_hash     String?
+  registry_slug    String?
+  registry_version String?
+  security_status  String? @default("unchecked")
+  installed_at     String  @default("datetime('now')")
+  updated_at       String  @default("datetime('now')")
+
+  @@unique([source, name], map: "sqlite_autoindex_skills_1")
+  @@index([registry_slug], map: "idx_skills_registry_slug")
+  @@index([source], map: "idx_skills_source")
+  @@index([name], map: "idx_skills_name")
+}
+
+/// The underlying table does not contain a valid unique identifier and can therefore currently not be handled by Prisma Client.
+model standup_reports {
+  date         String @id
+  report       String
+  created_at   Int    @default(dbgenerated("unixepoch()"))
+  workspace_id Int    @default(1)
+
+  @@index([workspace_id], map: "idx_standup_reports_workspace_id")
+  @@index([created_at], map: "idx_standup_reports_created_at")
+}
+
+model task_subscriptions {
+  id         Int    @id @default(autoincrement())
+  task_id    Int
+  agent_name String
+  created_at Int    @default(dbgenerated("unixepoch()"))
+  tasks      tasks  @relation(fields: [task_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([task_id, agent_name], map: "sqlite_autoindex_task_subscriptions_1")
+  @@index([agent_name], map: "idx_task_subscriptions_agent_name")
+  @@index([task_id], map: "idx_task_subscriptions_task_id")
+}
+
+model tasks {
+  id                  Int                  @id @default(autoincrement())
+  title               String
+  description         String?
+  status              String               @default("inbox")
+  priority            String               @default("medium")
+  assigned_to         String?
+  created_by          String               @default("system")
+  created_at          Int                  @default(dbgenerated("unixepoch()"))
+  updated_at          Int                  @default(dbgenerated("unixepoch()"))
+  due_date            Int?
+  estimated_hours     Int?
+  actual_hours        Int?
+  tags                String?
+  metadata            String?
+  workspace_id        Int                  @default(1)
+  project_id          Int?
+  project_ticket_no   Int?
+  outcome             String?
+  error_message       String?
+  resolution          String?
+  feedback_rating     Int?
+  feedback_notes      String?
+  retry_count         Int                  @default(0)
+  completed_at        Int?
+  github_issue_number Int?
+  github_repo         String?
+  github_synced_at    Int?
+  github_branch       String?
+  github_pr_number    Int?
+  github_pr_state     String?
+  comments            comments[]
+  quality_reviews     quality_reviews[]
+  task_subscriptions  task_subscriptions[]
+
+  @@unique([workspace_id, github_repo, github_issue_number], map: "idx_tasks_github_issue")
+  @@index([workspace_id], map: "idx_tasks_recurring")
+  @@index([workspace_id, outcome, completed_at], map: "idx_tasks_workspace_outcome")
+  @@index([completed_at], map: "idx_tasks_completed_at")
+  @@index([outcome], map: "idx_tasks_outcome")
+  @@index([workspace_id, project_id], map: "idx_tasks_workspace_project")
+  @@index([workspace_id], map: "idx_tasks_workspace_id")
+  @@index([created_at], map: "idx_tasks_created_at")
+  @@index([assigned_to], map: "idx_tasks_assigned_to")
+  @@index([status], map: "idx_tasks_status")
+}
+
+model tenants {
+  id             Int              @id @default(autoincrement())
+  slug           String           @unique(map: "sqlite_autoindex_tenants_1")
+  display_name   String
+  linux_user     String           @unique(map: "sqlite_autoindex_tenants_2")
+  plan_tier      String           @default("standard")
+  status         String           @default("pending")
+  openclaw_home  String
+  workspace_root String
+  gateway_port   Int?
+  dashboard_port Int?
+  config         String           @default("{}")
+  created_by     String           @default("system")
+  created_at     Int              @default(dbgenerated("unixepoch()"))
+  updated_at     Int              @default(dbgenerated("unixepoch()"))
+  owner_gateway  String?
+  provision_jobs provision_jobs[]
+  workspaces     workspaces[]
+
+  @@index([owner_gateway], map: "idx_tenants_owner_gateway")
+  @@index([status], map: "idx_tenants_status")
+  @@index([slug], map: "idx_tenants_slug")
+}
+
+model token_usage {
+  id            Int     @id @default(autoincrement())
+  model         String
+  session_id    String
+  input_tokens  Int     @default(0)
+  output_tokens Int     @default(0)
+  created_at    Int     @default(dbgenerated("unixepoch()"))
+  workspace_id  Int     @default(1)
+  task_id       Int?
+  cost_usd      Float?
+  agent_name    String?
+
+  @@index([workspace_id, task_id, created_at], map: "idx_token_usage_workspace_task_time")
+  @@index([task_id], map: "idx_token_usage_task_id")
+  @@index([workspace_id], map: "idx_token_usage_workspace_id")
+  @@index([model], map: "idx_token_usage_model")
+  @@index([created_at], map: "idx_token_usage_created_at")
+  @@index([session_id], map: "idx_token_usage_session_id")
+}
+
+model user_sessions {
+  id           Int     @id @default(autoincrement())
+  token        String  @unique(map: "sqlite_autoindex_user_sessions_1")
+  user_id      Int
+  expires_at   Int
+  created_at   Int     @default(dbgenerated("unixepoch()"))
+  ip_address   String?
+  user_agent   String?
+  workspace_id Int     @default(1)
+  tenant_id    Int?
+  users        users   @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([workspace_id, tenant_id], map: "idx_user_sessions_workspace_tenant")
+  @@index([tenant_id], map: "idx_user_sessions_tenant_id")
+  @@index([workspace_id], map: "idx_user_sessions_workspace_id")
+  @@index([expires_at], map: "idx_user_sessions_expires_at")
+  @@index([user_id], map: "idx_user_sessions_user_id")
+  @@index([token], map: "idx_user_sessions_token")
+}
+
+model users {
+  id               Int               @id @default(autoincrement())
+  username         String            @unique(map: "sqlite_autoindex_users_1")
+  display_name     String
+  password_hash    String
+  role             String            @default("operator")
+  created_at       Int               @default(dbgenerated("unixepoch()"))
+  updated_at       Int               @default(dbgenerated("unixepoch()"))
+  last_login_at    Int?
+  provider         String            @default("local")
+  provider_user_id String?
+  email            String?
+  avatar_url       String?
+  is_approved      Int               @default(1)
+  approved_by      String?
+  approved_at      Int?
+  workspace_id     Int               @default(1)
+  access_requests  access_requests[]
+  user_sessions    user_sessions[]
+
+  @@index([workspace_id], map: "idx_users_workspace_id")
+  @@index([email], map: "idx_users_email")
+  @@index([provider], map: "idx_users_provider")
+  @@index([username], map: "idx_users_username")
+}
+
+model webhook_deliveries {
+  id                 Int      @id @default(autoincrement())
+  webhook_id         Int
+  event_type         String
+  payload            String
+  status_code        Int?
+  response_body      String?
+  error              String?
+  duration_ms        Int?
+  created_at         Int      @default(dbgenerated("unixepoch()"))
+  attempt            Int      @default(0)
+  next_retry_at      Int?
+  is_retry           Int      @default(0)
+  parent_delivery_id Int?
+  workspace_id       Int      @default(1)
+  webhooks           webhooks @relation(fields: [webhook_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([workspace_id], map: "idx_webhook_deliveries_workspace_id")
+  @@index([next_retry_at], map: "idx_webhook_deliveries_retry", where: raw("next_retry_at IS NOT NULL"))
+  @@index([created_at], map: "idx_webhook_deliveries_created_at")
+  @@index([webhook_id], map: "idx_webhook_deliveries_webhook_id")
+}
+
+model webhooks {
+  id                   Int                  @id @default(autoincrement())
+  name                 String
+  url                  String
+  secret               String?
+  events               String               @default("[\"*\"]")
+  enabled              Int                  @default(1)
+  last_fired_at        Int?
+  last_status          Int?
+  created_by           String               @default("system")
+  created_at           Int                  @default(dbgenerated("unixepoch()"))
+  updated_at           Int                  @default(dbgenerated("unixepoch()"))
+  consecutive_failures Int                  @default(0)
+  workspace_id         Int                  @default(1)
+  webhook_deliveries   webhook_deliveries[]
+
+  @@index([workspace_id], map: "idx_webhooks_workspace_id")
+  @@index([enabled], map: "idx_webhooks_enabled")
+}
+
+model workflow_pipelines {
+  id            Int             @id @default(autoincrement())
+  name          String
+  description   String?
+  steps         String          @default("[]")
+  created_by    String          @default("system")
+  created_at    Int             @default(dbgenerated("unixepoch()"))
+  updated_at    Int             @default(dbgenerated("unixepoch()"))
+  use_count     Int             @default(0)
+  last_used_at  Int?
+  workspace_id  Int             @default(1)
+  pipeline_runs pipeline_runs[]
+
+  @@index([workspace_id], map: "idx_workflow_pipelines_workspace_id")
+  @@index([name], map: "idx_workflow_pipelines_name")
+}
+
+model workflow_templates {
+  id              Int     @id @default(autoincrement())
+  name            String
+  description     String?
+  model           String  @default("sonnet")
+  task_prompt     String
+  timeout_seconds Int     @default(300)
+  agent_role      String?
+  tags            String?
+  created_by      String  @default("system")
+  created_at      Int     @default(dbgenerated("unixepoch()"))
+  updated_at      Int     @default(dbgenerated("unixepoch()"))
+  last_used_at    Int?
+  use_count       Int     @default(0)
+  workspace_id    Int     @default(1)
+
+  @@index([workspace_id], map: "idx_workflow_templates_workspace_id")
+  @@index([created_by], map: "idx_workflow_templates_created_by")
+  @@index([name], map: "idx_workflow_templates_name")
+}
+
+model workspaces {
+  id              Int               @id @default(autoincrement())
+  slug            String            @unique(map: "sqlite_autoindex_workspaces_1")
+  name            String
+  tenant_id       Int
+  created_at      Int               @default(dbgenerated("unixepoch()"))
+  updated_at      Int               @default(dbgenerated("unixepoch()"))
+  adapter_configs adapter_configs[]
+  tenants         tenants           @relation(fields: [tenant_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([tenant_id], map: "idx_workspaces_tenant_id")
+  @@index([slug], map: "idx_workspaces_slug")
+}
